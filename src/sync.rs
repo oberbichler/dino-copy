@@ -50,9 +50,8 @@ impl ProgressSink for NullSink {
 /// source's mtime/atime and permissions.
 /// With `fsync`, the file contents are flushed to disk before the rename.
 pub fn copy_file(src: &Path, dst: &Path, sink: &dyn ProgressSink, fsync: bool) -> anyhow::Result<u64> {
-    if let Some(name) = dst.file_name().and_then(|n| n.to_str()) {
-        sink.set_current(name);
-    }
+    // What is being copied is announced by `execute`, which knows the path
+    // relative to the roots; here only absolute paths are available.
     // Directories are created by `execute` in phase 1; no create_dir_all per
     // file here (saves one stat per copy). copy_into_temp reads the metadata
     // via fstat from the open descriptor instead of a second path-based stat.
@@ -404,6 +403,9 @@ pub fn execute(
 
     let run_copies = |a: &&Action| {
         if let Action::Copy { rel, .. } = a {
+            // The path relative to the roots, not the bare file name: with a
+            // deep tree "b.txt" alone says nothing about where the run is.
+            sink.set_current(&rel.to_string_lossy());
             let src = source_root.join(rel);
             let dst = dest_root.join(rel);
             if let Err(e) = copy_file(&src, &dst, sink, opts.fsync) {
@@ -831,6 +833,47 @@ mod tests {
         }
         fn set_current(&self, _name: &str) {}
         fn inc_files(&self) {}
+    }
+
+    /// Sink that records the names passed to set_current.
+    #[derive(Default)]
+    struct NameSpy {
+        names: Mutex<Vec<String>>,
+    }
+    impl ProgressSink for NameSpy {
+        fn add_bytes(&self, _n: u64) {}
+        fn set_current(&self, name: &str) {
+            self.names.lock().unwrap().push(name.to_string());
+        }
+        fn inc_files(&self) {}
+    }
+
+    #[test]
+    fn progress_reports_the_path_relative_to_the_source_root() {
+        // The progress line has to show where in the tree the copy is. A bare
+        // file name is useless when every directory holds a "b.txt".
+        let tmp = tempfile::tempdir().unwrap();
+        let s = tmp.path().join("s");
+        let d = tmp.path().join("d");
+        fs::create_dir_all(s.join("sub/deep")).unwrap();
+        fs::write(s.join("sub/deep/b.txt"), b"x").unwrap();
+
+        let actions = vec![
+            Action::CreateDir(PathBuf::from("sub")),
+            Action::CreateDir(PathBuf::from("sub/deep")),
+            Action::Copy { rel: PathBuf::from("sub/deep/b.txt"), size: 1 },
+        ];
+        let spy = NameSpy::default();
+        let errors = Mutex::new(Vec::new());
+        let report =
+            execute(&s, &d, &actions, ExecOptions { jobs: 1, ..Default::default() }, &spy, &errors);
+
+        assert_eq!(report.failed, 0, "errors: {:?}", errors.lock().unwrap());
+        assert_eq!(
+            spy.names.lock().unwrap().as_slice(),
+            ["sub/deep/b.txt"],
+            "progress must report the path relative to the source root"
+        );
     }
 
     /// Sink that collects the temp file's permissions on the first chunk.
