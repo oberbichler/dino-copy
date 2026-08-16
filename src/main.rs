@@ -220,11 +220,8 @@ fn run() -> Result<()> {
         // display dino-copy appears frozen meanwhile.
         let bar = indicatif::ProgressBar::new(candidates.len() as u64);
         bar.set_style(
-            indicatif::ProgressStyle::with_template(
-                "{spinner} Checksums [{bar:40}] {pos}/{len} files",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
+            progress::spinner_template("{spin} Checksums [{bar:40}] {pos}/{len} files")
+                .progress_chars("=>-"),
         );
         let check = || {
             candidates
