@@ -1,8 +1,10 @@
 [package]
 name = "dino-copy"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-description = "Fast one-way directory mirror (e.g. for syncing two external USB HDDs): copies new/changed files, skips unchanged, deletes extras, preserves mtime and permissions."
+# Kept under 80 characters and without a trailing full stop: dist copies this
+# verbatim into the Homebrew formula's `desc`, which `brew audit` checks.
+description = "Fast one-way directory mirror for local disks"
 license = "ISC"
 repository = "https://github.com/oberbichler/dino-copy"
 homepage = "https://github.com/oberbichler/dino-copy"

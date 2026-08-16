@@ -16,7 +16,15 @@ use std::sync::Mutex;
 /// Mirrors a source directory onto a target directory (one-way sync).
 /// Afterwards the target holds exactly the same data as the source.
 #[derive(Parser, Debug)]
-#[command(name = "dino-copy", version, about)]
+#[command(
+    name = "dino-copy",
+    version,
+    about,
+    long_about = "Fast one-way directory mirror (e.g. for syncing two external USB HDDs): \
+                  copies new/changed files, skips unchanged ones, deletes extras and \
+                  preserves mtime and permissions.\n\n\
+                  The source is only ever read; every write goes to the target."
+)]
 struct Cli {
     /// Source directory (the lead). Stays unchanged.
     source: PathBuf,
