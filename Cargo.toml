@@ -30,3 +30,8 @@ tempfile = "3"
 [[bin]]
 name = "dino-copy"
 path = "src/main.rs"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
