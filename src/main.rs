@@ -333,7 +333,7 @@ fn run() -> Result<()> {
     }
 
     // 7. Execute with progress.
-    let prog = progress::Progress::new(stats.copy_bytes, stats.copy_count);
+    let prog = progress::Progress::new(stats.copy_bytes, stats.copy_count, effective_jobs);
     let errors = Mutex::new(Vec::new());
     let report = sync::execute(
         &source_root,

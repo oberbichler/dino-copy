@@ -37,12 +37,17 @@ pub fn spinner_template(template: &str) -> ProgressStyle {
 pub struct Progress {
     _multi: MultiProgress,
     bytes: ProgressBar,
-    current: ProgressBar,
+    files: ProgressBar,
+    /// One status line per copy worker. Copies run in parallel, so a single
+    /// shared line would jump between directories with every thread that
+    /// happens to write last.
+    workers: Vec<ProgressBar>,
 }
 
 impl Progress {
-    /// Creates a progress display for `total_bytes` and `total_files`.
-    pub fn new(total_bytes: u64, total_files: u64) -> Self {
+    /// Creates a progress display for `total_bytes` and `total_files`, with one
+    /// status line for each of the `jobs` copy workers.
+    pub fn new(total_bytes: u64, total_files: u64, jobs: usize) -> Self {
         let multi = MultiProgress::new();
         let bytes = multi.add(ProgressBar::new(total_bytes));
         bytes.set_style(
@@ -51,16 +56,25 @@ impl Progress {
             )
             .progress_chars("=>-"),
         );
-        let current = multi.add(ProgressBar::new(total_files));
-        current.set_style(
-            ProgressStyle::with_template("  {pos}/{len} files  {wide_msg}").unwrap(),
-        );
-        Self { _multi: multi, bytes, current }
+        let files = multi.add(ProgressBar::new(total_files));
+        files.set_style(ProgressStyle::with_template("  {pos}/{len} files").unwrap());
+        let workers = (0..jobs.max(1))
+            .map(|i| {
+                let bar = multi.add(ProgressBar::new_spinner());
+                bar.set_style(ProgressStyle::with_template("  {prefix:>2}  {wide_msg}").unwrap());
+                bar.set_prefix((i + 1).to_string());
+                bar
+            })
+            .collect();
+        Self { _multi: multi, bytes, files, workers }
     }
 
     pub fn finish(&self) {
+        for worker in &self.workers {
+            worker.finish_and_clear();
+        }
+        self.files.finish_and_clear();
         self.bytes.finish();
-        self.current.finish_and_clear();
     }
 }
 
@@ -68,11 +82,15 @@ impl ProgressSink for Progress {
     fn add_bytes(&self, n: u64) {
         self.bytes.inc(n);
     }
-    fn set_current(&self, name: &str) {
-        self.current.set_message(name.to_string());
+    fn set_current(&self, worker: usize, name: &str) {
+        // Modulo rather than indexing straight in: on the fallback path
+        // `execute` runs outside its own pool, where the thread index can
+        // exceed the number of lines. Sharing a line beats panicking.
+        let line = &self.workers[worker % self.workers.len()];
+        line.set_message(name.to_string());
     }
     fn inc_files(&self) {
-        self.current.inc(1);
+        self.files.inc(1);
     }
 }
 

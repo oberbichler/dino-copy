@@ -32,7 +32,10 @@ pub fn cleanup_temps() {
 /// Callback invoked after each copied file chunk (for progress reporting).
 pub trait ProgressSink: Sync {
     fn add_bytes(&self, n: u64);
-    fn set_current(&self, name: &str);
+    /// Announces that `worker` is now copying `name`. Copies run in parallel,
+    /// so a single shared status line would jump between directories — the
+    /// worker index lets each thread own one line.
+    fn set_current(&self, worker: usize, name: &str);
     fn inc_files(&self);
 }
 
@@ -42,7 +45,7 @@ pub struct NullSink;
 #[cfg(test)]
 impl ProgressSink for NullSink {
     fn add_bytes(&self, _n: u64) {}
-    fn set_current(&self, _name: &str) {}
+    fn set_current(&self, _worker: usize, _name: &str) {}
     fn inc_files(&self) {}
 }
 
@@ -405,7 +408,13 @@ pub fn execute(
         if let Action::Copy { rel, .. } = a {
             // The path relative to the roots, not the bare file name: with a
             // deep tree "b.txt" alone says nothing about where the run is.
-            sink.set_current(&rel.to_string_lossy());
+            // current_thread_index() is the index inside the pool installed
+            // below, so each copy thread consistently addresses its own line.
+            // Outside a pool (fallback path) everything lands on line 0.
+            sink.set_current(
+                rayon::current_thread_index().unwrap_or(0),
+                &rel.to_string_lossy(),
+            );
             let src = source_root.join(rel);
             let dst = dest_root.join(rel);
             if let Err(e) = copy_file(&src, &dst, sink, opts.fsync) {
@@ -831,21 +840,51 @@ mod tests {
         fn add_bytes(&self, n: u64) {
             self.bytes.fetch_add(n, Ordering::Relaxed);
         }
-        fn set_current(&self, _name: &str) {}
+        fn set_current(&self, _worker: usize, _name: &str) {}
         fn inc_files(&self) {}
     }
 
-    /// Sink that records the names passed to set_current.
+    /// Sink that records the (worker, name) pairs passed to set_current.
     #[derive(Default)]
     struct NameSpy {
-        names: Mutex<Vec<String>>,
+        names: Mutex<Vec<(usize, String)>>,
     }
     impl ProgressSink for NameSpy {
         fn add_bytes(&self, _n: u64) {}
-        fn set_current(&self, name: &str) {
-            self.names.lock().unwrap().push(name.to_string());
+        fn set_current(&self, worker: usize, name: &str) {
+            self.names.lock().unwrap().push((worker, name.to_string()));
         }
         fn inc_files(&self) {}
+    }
+
+    #[test]
+    fn each_copy_is_announced_with_its_worker_index() {
+        // With one status line per worker, every copy has to say WHICH worker
+        // it belongs to — otherwise parallel copies overwrite each other's line
+        // and the display jumps between directories.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = tmp.path().join("s");
+        let d = tmp.path().join("d");
+        fs::create_dir_all(&s).unwrap();
+        let mut actions = Vec::new();
+        for i in 0..12 {
+            let name = format!("f{i}.txt");
+            fs::write(s.join(&name), b"x").unwrap();
+            actions.push(Action::Copy { rel: PathBuf::from(&name), size: 1 });
+        }
+
+        let spy = NameSpy::default();
+        let errors = Mutex::new(Vec::new());
+        let report =
+            execute(&s, &d, &actions, ExecOptions { jobs: 2, ..Default::default() }, &spy, &errors);
+
+        assert_eq!(report.failed, 0, "errors: {:?}", errors.lock().unwrap());
+        let seen = spy.names.lock().unwrap();
+        assert_eq!(seen.len(), 12, "every copy must be announced");
+        assert!(
+            seen.iter().all(|(worker, _)| *worker < 2),
+            "worker indices must stay inside the pool of 2: {seen:?}"
+        );
     }
 
     #[test]
@@ -869,8 +908,9 @@ mod tests {
             execute(&s, &d, &actions, ExecOptions { jobs: 1, ..Default::default() }, &spy, &errors);
 
         assert_eq!(report.failed, 0, "errors: {:?}", errors.lock().unwrap());
+        let seen = spy.names.lock().unwrap();
         assert_eq!(
-            spy.names.lock().unwrap().as_slice(),
+            seen.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(),
             ["sub/deep/b.txt"],
             "progress must report the path relative to the source root"
         );
@@ -897,7 +937,7 @@ mod tests {
                 }
             }
         }
-        fn set_current(&self, _name: &str) {}
+        fn set_current(&self, _worker: usize, _name: &str) {}
         fn inc_files(&self) {}
     }
 
