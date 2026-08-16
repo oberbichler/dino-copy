@@ -1,0 +1,32 @@
+[package]
+name = "dino-copy"
+version = "0.1.0"
+edition = "2024"
+description = "Fast one-way directory mirror (e.g. for syncing two external USB HDDs): copies new/changed files, skips unchanged, deletes extras, preserves mtime and permissions."
+license = "ISC"
+repository = "https://github.com/oberbichler/dino-copy"
+homepage = "https://github.com/oberbichler/dino-copy"
+readme = "README.md"
+keywords = ["sync", "mirror", "backup", "copy", "cli"]
+categories = ["command-line-utilities", "filesystem"]
+rust-version = "1.85"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+globset = "0.4"
+jwalk = "0.8"
+indicatif = "0.18"
+filetime = "0.2"
+blake3 = "1"
+anyhow = "1"
+# termination: additionally catches SIGTERM and SIGHUP. Without the feature,
+# temp files are left behind in the target on a cron timeout or at logout.
+ctrlc = { version = "3", features = ["termination"] }
+rayon = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "dino-copy"
+path = "src/main.rs"
