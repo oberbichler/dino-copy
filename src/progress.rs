@@ -69,6 +69,15 @@ impl Progress {
         Self { _multi: multi, bytes, files, workers }
     }
 
+    /// The status line belonging to `worker`.
+    ///
+    /// Modulo rather than indexing straight in: on the fallback path `execute`
+    /// runs outside its own pool, where the thread index can exceed the number
+    /// of lines. Sharing a line beats panicking.
+    fn worker_line(&self, worker: usize) -> &ProgressBar {
+        &self.workers[worker % self.workers.len()]
+    }
+
     pub fn finish(&self) {
         for worker in &self.workers {
             worker.finish_and_clear();
@@ -83,11 +92,10 @@ impl ProgressSink for Progress {
         self.bytes.inc(n);
     }
     fn set_current(&self, worker: usize, name: &str) {
-        // Modulo rather than indexing straight in: on the fallback path
-        // `execute` runs outside its own pool, where the thread index can
-        // exceed the number of lines. Sharing a line beats panicking.
-        let line = &self.workers[worker % self.workers.len()];
-        line.set_message(name.to_string());
+        self.worker_line(worker).set_message(name.to_string());
+    }
+    fn set_done(&self, worker: usize) {
+        self.worker_line(worker).set_message("finished");
     }
     fn inc_files(&self) {
         self.files.inc(1);

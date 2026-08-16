@@ -36,6 +36,10 @@ pub trait ProgressSink: Sync {
     /// so a single shared status line would jump between directories — the
     /// worker index lets each thread own one line.
     fn set_current(&self, worker: usize, name: &str);
+    /// Announces that `worker` will receive no further work. Without this its
+    /// line would keep showing the last copied file through the delete and
+    /// metadata phases, which can take a while.
+    fn set_done(&self, worker: usize);
     fn inc_files(&self);
 }
 
@@ -46,6 +50,7 @@ pub struct NullSink;
 impl ProgressSink for NullSink {
     fn add_bytes(&self, _n: u64) {}
     fn set_current(&self, _worker: usize, _name: &str) {}
+    fn set_done(&self, _worker: usize) {}
     fn inc_files(&self) {}
 }
 
@@ -404,6 +409,12 @@ pub fn execute(
         .num_threads(effective_jobs)
         .build();
 
+    // Copies not yet picked up by any worker. Once this hits zero no worker can
+    // be handed more work, so whoever finishes its current file then is done
+    // for good and its status line can say so — rather than showing a stale
+    // path through the delete and metadata phases that follow.
+    let unclaimed = AtomicU64::new(copies.len() as u64);
+
     let run_copies = |a: &&Action| {
         if let Action::Copy { rel, .. } = a {
             // The path relative to the roots, not the bare file name: with a
@@ -411,15 +422,17 @@ pub fn execute(
             // current_thread_index() is the index inside the pool installed
             // below, so each copy thread consistently addresses its own line.
             // Outside a pool (fallback path) everything lands on line 0.
-            sink.set_current(
-                rayon::current_thread_index().unwrap_or(0),
-                &rel.to_string_lossy(),
-            );
+            let worker = rayon::current_thread_index().unwrap_or(0);
+            unclaimed.fetch_sub(1, Ordering::Relaxed);
+            sink.set_current(worker, &rel.to_string_lossy());
             let src = source_root.join(rel);
             let dst = dest_root.join(rel);
             if let Err(e) = copy_file(&src, &dst, sink, opts.fsync) {
                 failed.fetch_add(1, Ordering::Relaxed);
                 record_error(errors, format!("copy {}: {e}", rel.display()));
+            }
+            if unclaimed.load(Ordering::Relaxed) == 0 {
+                sink.set_done(worker);
             }
         }
     };
@@ -427,6 +440,12 @@ pub fn execute(
     match pool {
         Ok(p) => p.install(|| copies.par_iter().for_each(run_copies)),
         Err(_) => copies.par_iter().for_each(run_copies),
+    }
+
+    // Belt and braces: whatever the scheduling was, no copy runs past this
+    // point, so no line may still claim one.
+    for worker in 0..effective_jobs {
+        sink.set_done(worker);
     }
 
     // Phase 2b: create symlinks (serially). An existing target is replaced.
@@ -841,20 +860,57 @@ mod tests {
             self.bytes.fetch_add(n, Ordering::Relaxed);
         }
         fn set_current(&self, _worker: usize, _name: &str) {}
+        fn set_done(&self, _worker: usize) {}
         fn inc_files(&self) {}
     }
 
-    /// Sink that records the (worker, name) pairs passed to set_current.
+    /// Sink that records the (worker, name) pairs passed to set_current and
+    /// which workers were reported as done.
     #[derive(Default)]
     struct NameSpy {
         names: Mutex<Vec<(usize, String)>>,
+        done: Mutex<std::collections::BTreeSet<usize>>,
     }
     impl ProgressSink for NameSpy {
         fn add_bytes(&self, _n: u64) {}
         fn set_current(&self, worker: usize, name: &str) {
             self.names.lock().unwrap().push((worker, name.to_string()));
         }
+        fn set_done(&self, worker: usize) {
+            self.done.lock().unwrap().insert(worker);
+        }
         fn inc_files(&self) {}
+    }
+
+    #[test]
+    fn every_busy_worker_is_reported_done_once_the_copies_are_over() {
+        // Otherwise a worker's line keeps showing its last file through the
+        // delete and metadata phases, which can run for a long time.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = tmp.path().join("s");
+        let d = tmp.path().join("d");
+        fs::create_dir_all(&s).unwrap();
+        let mut actions = Vec::new();
+        for i in 0..12 {
+            let name = format!("f{i}.txt");
+            fs::write(s.join(&name), b"x").unwrap();
+            actions.push(Action::Copy { rel: PathBuf::from(&name), size: 1 });
+        }
+
+        let spy = NameSpy::default();
+        let errors = Mutex::new(Vec::new());
+        let report =
+            execute(&s, &d, &actions, ExecOptions { jobs: 2, ..Default::default() }, &spy, &errors);
+
+        assert_eq!(report.failed, 0, "errors: {:?}", errors.lock().unwrap());
+        let busy: std::collections::BTreeSet<usize> =
+            spy.names.lock().unwrap().iter().map(|(w, _)| *w).collect();
+        let done = spy.done.lock().unwrap().clone();
+        assert!(!busy.is_empty(), "at least one worker must have copied something");
+        assert!(
+            busy.is_subset(&done),
+            "every worker that showed a file must end up done: busy={busy:?} done={done:?}"
+        );
     }
 
     #[test]
@@ -938,6 +994,7 @@ mod tests {
             }
         }
         fn set_current(&self, _worker: usize, _name: &str) {}
+        fn set_done(&self, _worker: usize) {}
         fn inc_files(&self) {}
     }
 
