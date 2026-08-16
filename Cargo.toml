@@ -1,6 +1,6 @@
 [package]
 name = "dino-copy"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # Kept under 80 characters and without a trailing full stop: dist copies this
 # verbatim into the Homebrew formula's `desc`, which `brew audit` checks.
