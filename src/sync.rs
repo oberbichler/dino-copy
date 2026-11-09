@@ -343,55 +343,6 @@ pub fn record_error(errors: &std::sync::Mutex<Vec<String>>, msg: String) {
     }
 }
 
-/// Picks a sensible default copy parallelism depending on the target volume.
-///
-/// Rotating HDDs have a physical write head: too many parallel writers cause
-/// seek thrashing and are often slower than 1–2. SSDs, in contrast, benefit
-/// from high parallelism. If the type cannot be determined, the more
-/// conservative HDD value is chosen (safer for the expected use case of
-/// "external disks").
-pub fn default_copy_jobs(dest_root: &Path) -> usize {
-    match is_ssd(dest_root) {
-        Some(true) => std::thread::available_parallelism().map_or(4, |n| n.get()),
-        // HDD or unknown: conservative, but enough for read/write pipelining.
-        _ => 2,
-    }
-}
-
-/// Determines via `diskutil info` whether the volume under `path` is an SSD.
-/// `Some(true)`/`Some(false)` on a clear answer, `None` when unknown.
-#[cfg(target_os = "macos")]
-fn is_ssd(path: &Path) -> Option<bool> {
-    let out = std::process::Command::new("diskutil")
-        .arg("info")
-        .arg(path)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        // A line looks like "   Solid State:               Yes"
-        if let Some(rest) = line.trim().strip_prefix("Solid State:") {
-            let v = rest.trim().to_ascii_lowercase();
-            if v.starts_with("yes") {
-                return Some(true);
-            }
-            if v.starts_with("no") {
-                return Some(false);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "macos"))]
-fn is_ssd(_path: &Path) -> Option<bool> {
-    // No detection on other platforms – the conservative default applies.
-    None
-}
-
 /// Removes a target regardless of its type (file, symlink or directory).
 pub fn remove_any(path: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
@@ -596,17 +547,6 @@ mod tests {
             size as u64,
             "the reported bytes must match the file size"
         );
-    }
-
-    #[test]
-    fn default_copy_jobs_is_sane() {
-        // For a tempdir the detection yields either SSD (CPU count) or the
-        // conservative fallback (2) – in any case >= 1.
-        let tmp = tempfile::tempdir().unwrap();
-        let jobs = default_copy_jobs(tmp.path());
-        let cpus = std::thread::available_parallelism().map_or(4, |n| n.get());
-        assert!(jobs >= 1, "jobs must be at least 1, was {jobs}");
-        assert!(jobs <= cpus.max(2), "jobs unexpectedly high: {jobs}");
     }
 
     /// Sink that sums up the reported bytes.

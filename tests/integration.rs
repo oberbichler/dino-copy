@@ -1009,3 +1009,12 @@ fn invalid_exclude_pattern_is_reported() {
         "the error message must name the pattern: {stderr}"
     );
 }
+
+#[test]
+fn zero_jobs_is_rejected() {
+    // 0 used to mean "detect the disk type"; the default is now a fixed 2.
+    let (_tmp, s, d) = setup();
+    let out = run(&s, &d, &["--jobs", "0"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--jobs"));
+}
