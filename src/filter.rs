@@ -1,3 +1,5 @@
+//! `--exclude` patterns.
+
 use std::path::Path;
 
 /// Exclusion filter for scan entries.
@@ -7,6 +9,11 @@ use std::path::Path;
 /// Without that symmetry, mirroring two macOS volume roots would be impossible
 /// — each disk has its own `.Spotlight-V100`/`.fseventsd`, and `.Trashes`
 /// cannot even be deleted.
+///
+/// One exception: when a whole directory is removed from the target (it no
+/// longer exists in the source, or a file of the same name replaces it), its
+/// excluded contents go with it. Otherwise a deleted folder would linger
+/// forever just because macOS put a `.DS_Store` into it.
 ///
 /// Pattern kinds (deliberately reduced rsync semantics):
 /// - without `/`: matches the file name at any depth (`.DS_Store`, `*.tmp`)

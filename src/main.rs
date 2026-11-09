@@ -1,11 +1,29 @@
+//! dino-copy: a fast one-way mirror for local disks.
+//!
+//! The run is split into modules along its phases:
+//!
+//! - [`walk`]: the streaming two-pass walk (plan, then execute) and the rules
+//!   for what may be deleted;
+//! - [`plan`]: the entry model and the per-directory comparison;
+//! - [`sync`]: the file system operations on the target;
+//! - [`filter`]: `--exclude` patterns;
+//! - [`progress`]: the terminal display.
+//!
+//! This file holds the CLI, the safety checks before anything is touched
+//! (nested paths, empty source, `--max-delete`, confirmation) and the report.
+
+#![forbid(unsafe_code)]
+
 #[cfg(not(unix))]
 compile_error!("dino-copy only supports Unix systems (macOS, Linux): it requires Unix permissions and symlinks.");
 
 mod filter;
 mod plan;
 mod progress;
-mod scan;
 mod sync;
+mod walk;
+#[cfg(test)]
+mod walk_props;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -48,7 +66,7 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     jobs: usize,
 
-    /// Scan parallelism (0 = jwalk default).
+    /// Scan parallelism (0 = one thread per CPU).
     #[arg(long = "scan-jobs", default_value_t = 0)]
     scan_jobs: usize,
 
@@ -72,10 +90,10 @@ struct Cli {
     #[arg(long = "allow-empty-source")]
     allow_empty_source: bool,
 
-    /// Delete even when directories could not be read or copies failed. The
-    /// default is to skip the deletions: after an incomplete run the
-    /// extraneous target entries may be the only remaining reachable version
-    /// of the data.
+    /// Delete even when directories could not be read, copies failed or names
+    /// could not be mirrored. The default is to skip the deletions: after an
+    /// incomplete run the extraneous target entries may be the only remaining
+    /// reachable version of the data.
     #[arg(long = "ignore-errors")]
     ignore_errors: bool,
 
@@ -137,41 +155,19 @@ fn run() -> Result<()> {
     println!("Source: {}", source_root.display());
     println!("Target: {}", dest_root.display());
 
-    // 2. Scan both trees in parallel. Source and target typically live on
-    // different disks (two external HDDs), so rayon::join overlaps the I/O of
-    // both scans instead of serializing them.
+    // 2. Pass 1 (plan): walk both trees directory by directory and count what
+    // has to happen. Nothing is kept per entry, so memory stays bounded by the
+    // tree depth instead of growing with the number of files.
     println!("Scanning directories ...");
     // The same filter for both trees: excluded target entries are invisible
     // that way and are neither overwritten nor deleted.
     let filter = filter::Filter::new(&cli.exclude)?;
-    let (src_res, dst_res) = rayon::join(
-        || scan::scan_tree(&source_root, cli.scan_jobs, &filter),
-        || {
-            // In a dry run the target may still be missing (see above): then it
-            // is empty by definition, rather than letting the scan fail.
-            if dest_root.is_dir() {
-                scan::scan_tree(&dest_root, cli.scan_jobs, &filter)
-            } else {
-                Ok(scan::Scan { entries: std::collections::BTreeMap::new(), unreadable: Vec::new() })
-            }
-        },
-    );
-    let src_scan = src_res.with_context(|| format!("Scan {}", source_root.display()))?;
-    let dst_scan = dst_res.with_context(|| format!("Scan {}", dest_root.display()))?;
-
-    // Unreadable directories make the comparison incomplete: their contents are
-    // missing from the map even though they exist. Report that visibly instead
-    // of pretending they were empty.
-    let mut unreadable = 0usize;
-    for (root, scan) in [(&source_root, &src_scan), (&dest_root, &dst_scan)] {
-        for (rel, err) in &scan.unreadable {
-            eprintln!("Warning: contents not readable: {} ({err})", root.join(rel).display());
-            unreadable += 1;
-        }
-    }
-
-    let src_map = src_scan.entries;
-    let dst_map = dst_scan.entries;
+    let roots = walk::Roots {
+        src: &source_root,
+        dst: &dest_root,
+        filter: &filter,
+        mtime_tol: cli.mtime_window,
+    };
 
     // Determine the copy/hash parallelism once: on macOS is_ssd spawns a
     // diskutil process, and that must not happen repeatedly.
@@ -181,125 +177,80 @@ fn run() -> Result<()> {
         sync::default_copy_jobs(&dest_root)
     };
 
-    // 3. Optional: blake3 verification for seemingly unchanged files.
-    // Mismatches are fed into the diff as forced copies so that they run
-    // through the same logic (statistics, SetDirMeta for touched dirs).
-    let mut forced = std::collections::BTreeSet::new();
-    if cli.checksum {
-        use plan::EntryKind;
-        use rayon::prelude::*;
-
-        // Candidates: files that count as unchanged by size+mtime — only these
-        // are additionally verified via blake3.
-        let candidates: Vec<PathBuf> = src_map
-            .iter()
-            .filter_map(|(rel, s)| {
-                if s.kind != EntryKind::File {
-                    return None;
-                }
-                match dst_map.get(rel) {
-                    Some(d)
-                        if d.kind == EntryKind::File
-                            && plan::unchanged(s, d, cli.mtime_window) =>
-                    {
-                        Some(rel.clone())
-                    }
-                    _ => None,
-                }
-            })
-            .collect();
-
-        // Hash in parallel: across the candidates (par_iter) and, per file,
-        // source and target at the same time (rayon::join — they live on
-        // different disks, so the reads overlap). Pick the parallelism like the
-        // copy phase does (SSD: many, HDD/unknown: conservative) so rotating
-        // disks do not end up seek-thrashing. To be safe, a read error counts
-        // as "different" (the file is then copied).
-        // Show progress: the verification reads every candidate file in full on
-        // both sides and can take a long time on large data sets — without a
-        // display dino-copy appears frozen meanwhile.
-        let bar = indicatif::ProgressBar::new(candidates.len() as u64);
-        bar.set_style(
-            progress::spinner_template("{spin} Checksums [{bar:40}] {pos}/{len} files")
-                .progress_chars("=>-"),
-        );
-        let check = || {
-            candidates
-                .par_iter()
-                .filter(|rel| {
-                    let rel = rel.as_path();
-                    let sp = source_root.join(rel);
-                    let dp = dest_root.join(rel);
-                    let (hs, hd) =
-                        rayon::join(|| plan::hash_file(&sp), || plan::hash_file(&dp));
-                    bar.inc(1);
-                    match (hs, hd) {
-                        (Ok(hs), Ok(hd)) => hs != hd,
-                        _ => true,
-                    }
-                })
-                .cloned()
-                .collect::<Vec<PathBuf>>()
-        };
-        let differing = match rayon::ThreadPoolBuilder::new()
-            .num_threads(effective_jobs)
-            .build()
-        {
-            Ok(pool) => pool.install(check),
-            Err(_) => check(),
-        };
-        bar.finish_and_clear();
-        forced.extend(differing);
-    }
-
-    // 4. Plan the diff.
-    let (mut actions, mut stats) =
-        plan::diff_with_forced(&src_map, &dst_map, cli.mtime_window, &forced);
+    // With --checksum, pass 1 also verifies every file that looks unchanged by
+    // size+mtime via blake3. Only the mismatches are kept (as forced copies).
+    let scan_progress = progress::ScanProgressBars::new(cli.checksum);
+    let planned = walk::plan(
+        &roots,
+        walk::PlanOptions {
+            scan_jobs: cli.scan_jobs,
+            checksum: cli.checksum,
+            hash_jobs: effective_jobs,
+        },
+        Some(&scan_progress),
+    );
+    scan_progress.finish();
+    let mut stats = planned.stats.clone();
+    let unreadable = planned.unreadable;
+    // Everything on the target that would be removed if the source is empty.
+    let target_entries = stats.remove_count + stats.conflict_count;
 
     // After an incomplete scan, deleting is not defensible: whatever lies below
     // an unreadable directory would look like an extraneous target entry and
     // would be removed — even though the source does contain it, just
-    // unreadably.
-    if unreadable > 0 && !cli.ignore_errors && stats.delete_count > 0 {
+    // unreadably. Pass 2 enforces the same rule.
+    if unreadable > 0 && !cli.ignore_errors && stats.remove_count > 0 {
         eprintln!(
             "Warning: {} planned deletion(s) are skipped because {} \
              directory/directories are not readable (--ignore-errors forces them).",
-            stats.delete_count, unreadable
+            stats.remove_count, unreadable
         );
-        actions.retain(|a| {
-            !matches!(a, plan::Action::DeleteFile(_) | plan::Action::DeleteDir(_))
-        });
-        stats.delete_count = 0;
+        stats.remove_count = 0;
+    }
+    // A name collision leaves a source entry out: it fails the run (pass 2
+    // reports it as an error), which in turn blocks the deletions. It does not
+    // go away by itself, so say how to resolve it.
+    if planned.collisions > 0 {
+        eprintln!("{COLLISION_HINT}");
+    }
+    if planned.collisions > 0 && !cli.ignore_errors && stats.remove_count > 0 {
+        eprintln!(
+            "Warning: {} planned deletion(s) are skipped because {} entries cannot \
+             be mirrored (--ignore-errors forces them).",
+            stats.remove_count, planned.collisions
+        );
+        stats.remove_count = 0;
     }
 
     println!(
-        "Plan: copy {} ({:.2} MB), delete {}, {} directories, {} file metadata, {} skipped.",
+        "Plan: copy {} ({:.2} MB), delete {}, {} directories, {} file metadata, {} renamed, {} skipped.",
         stats.copy_count,
         stats.copy_bytes as f64 / 1_000_000.0,
-        stats.delete_count,
+        stats.delete_count(),
         stats.mkdir_count,
         stats.meta_count,
+        stats.rename_count,
         stats.skip_count
     );
 
-    // 5. Safety nets against mass deletion. Both take effect BEFORE the dry-run
+    // 3. Safety nets against mass deletion. Both take effect BEFORE the dry-run
     // exit, so that a trial run reports them too, and before the confirmation,
     // so that --yes cannot bypass them.
-    if src_map.is_empty() && !dst_map.is_empty() && !cli.allow_empty_source {
+    if planned.source_empty && target_entries > 0 && !cli.allow_empty_source {
         bail!(
             "Source {} is empty, but the target holds {} entries. Aborting: this \
              looks like an unmounted source disk. If the target really should be \
              emptied: --allow-empty-source",
             source_root.display(),
-            dst_map.len()
+            target_entries
         );
     }
     if let Some(max) = cli.max_delete {
-        if stats.delete_count > max {
+        if stats.delete_count() > max {
             bail!(
                 "{} deletions exceed the limit --max-delete {}. Aborting, \
                  nothing changed.",
-                stats.delete_count,
+                stats.delete_count(),
                 max
             );
         }
@@ -307,42 +258,39 @@ fn run() -> Result<()> {
 
     if cli.dry_run {
         println!("(dry-run: no changes)");
-        if unreadable > 0 {
-            return Err(incomplete_scan_error(unreadable));
-        }
-        return Ok(());
+        return incomplete_result(unreadable, planned.collisions);
     }
 
-    // The root produces no action (it appears in neither map), but it has to be
-    // mirrored as well — otherwise a pure metadata drift of the root would be
-    // permanent.
+    // The root produces no action (the walk never compares it), but it has to
+    // be mirrored as well — otherwise a pure metadata drift of the root would
+    // be permanent.
     let root_meta_pending = sync::root_meta_differs(&source_root, &dest_root, cli.mtime_window);
 
-    if actions.is_empty() && !root_meta_pending {
+    if stats.is_noop() && !root_meta_pending {
         println!("Nothing to do. Target is already in sync.");
-        if unreadable > 0 {
-            return Err(incomplete_scan_error(unreadable));
-        }
-        return Ok(());
+        return incomplete_result(unreadable, planned.collisions);
     }
 
-    // 6. Confirmation when there are deletions.
-    if stats.delete_count > 0 && !cli.yes && !confirm(stats.delete_count)? {
+    // 4. Confirmation when there are deletions.
+    if stats.delete_count() > 0 && !cli.yes && !confirm(stats.delete_count())? {
         println!("Aborted.");
         return Ok(());
     }
 
-    // 7. Execute with progress.
+    // 5. Pass 2 (execute): walk again and mirror. Copies stream through a
+    // bounded queue to the workers while the walk continues.
     let prog = progress::Progress::new(stats.copy_bytes, stats.copy_count, effective_jobs);
     let errors = Mutex::new(Vec::new());
-    let report = sync::execute(
-        &source_root,
-        &dest_root,
-        &actions,
-        sync::ExecOptions {
+    let report = walk::execute(
+        &roots,
+        &planned,
+        walk::ExecOptions {
             jobs: effective_jobs,
+            scan_jobs: cli.scan_jobs,
             fsync: cli.fsync,
             ignore_errors: cli.ignore_errors,
+            // Never remove more than was shown and confirmed above.
+            delete_budget: stats.remove_count,
         },
         &prog,
         &errors,
@@ -359,12 +307,27 @@ fn run() -> Result<()> {
         }
     }
 
-    if report.skipped_deletes > 0 {
-        eprintln!(
+    let mut exceeded = false;
+    match report.skip_reason {
+        None => {}
+        Some(walk::SkipReason::FailedActions) => eprintln!(
             "Warning: {} deletion(s) skipped because {} action(s) failed \
              (--ignore-errors forces them).",
             report.skipped_deletes, report.failed
-        );
+        ),
+        Some(walk::SkipReason::Unreadable) => eprintln!(
+            "Warning: {} deletion(s) skipped because {} directory/directories are \
+             not readable (--ignore-errors forces them).",
+            report.skipped_deletes, report.unreadable
+        ),
+        Some(walk::SkipReason::Unplanned { planned, found }) => {
+            eprintln!(
+                "Warning: found {found} deletion(s) while mirroring that do not match \
+                 the {planned} planned. The source or target changed (or was unmounted) \
+                 during the run, so nothing was deleted. Run dino-copy again."
+            );
+            exceeded = true;
+        }
     }
 
     // The root itself comes last: every change in the target just touched its
@@ -378,8 +341,12 @@ fn run() -> Result<()> {
     }
     // Whatever was readable has been copied — but "the target now mirrors the
     // source" would be a lie as long as directories stayed unread.
+    let unreadable = unreadable.max(report.unreadable);
     if unreadable > 0 {
         return Err(incomplete_scan_error(unreadable));
+    }
+    if exceeded {
+        bail!("Deletions skipped because the source changed during the run.");
     }
 
     println!("Done. The target now mirrors the source.");
@@ -389,7 +356,26 @@ fn run() -> Result<()> {
 /// Error for an incomplete run. Unreadable directories mean that dino-copy does
 /// not fully know the source inventory: the mirror cannot be exact, and that
 /// must be reflected in the exit code (cron job).
-fn incomplete_scan_error(count: usize) -> anyhow::Error {
+/// Explanation printed once when source names collide on the target.
+const COLLISION_HINT: &str = "\
+Hint: the target file system cannot tell some source names apart (they differ
+only in case, e.g. \"Foo\" and \"foo\"), so it can hold only one of them. Until
+this is resolved, every run reports it and withholds all deletions. Either
+rename one of the entries in the source, leave one out with --exclude, or use
+a target volume that distinguishes case (e.g. APFS (Case-sensitive)).";
+
+/// `Ok` for a complete mirror, otherwise the error describing what is missing.
+fn incomplete_result(unreadable: u64, collisions: u64) -> Result<()> {
+    if unreadable > 0 {
+        return Err(incomplete_scan_error(unreadable));
+    }
+    if collisions > 0 {
+        bail!("{collisions} entries could not be mirrored (name collisions) - the mirror is incomplete.");
+    }
+    Ok(())
+}
+
+fn incomplete_scan_error(count: u64) -> anyhow::Error {
     anyhow::anyhow!(
         "{count} directory/directories could not be read - the mirror is \
          incomplete."

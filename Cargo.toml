@@ -16,7 +16,6 @@ rust-version = "1.85"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 globset = "0.4"
-jwalk = "0.8"
 indicatif = "0.18"
 filetime = "0.2"
 blake3 = "1"
@@ -25,8 +24,10 @@ anyhow = "1"
 # temp files are left behind in the target on a cron timeout or at logout.
 ctrlc = { version = "3", features = ["termination"] }
 rayon = "1"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 
 [[bin]]
