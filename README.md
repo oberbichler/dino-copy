@@ -52,7 +52,7 @@ Useful options:
 | `--checksum` | Also compare the contents (BLAKE3) of files whose size and mtime match. Reads everything on both sides. |
 | `--fsync` | Flush every file and directory to the disk before moving on. Slower, safer on power loss. |
 | `--mtime-window S` | Treat mtimes up to `S` seconds apart as equal (default 2, for FAT32/exFAT). |
-| `--jobs N` | Parallel copies (default: one per CPU on SSDs, otherwise 2; the disk type is only detected on macOS). |
+| `--jobs N` | Parallel copies and checksum reads (default 2). Keep 2 for hard disks; on SSDs, `--jobs 8` speeds up medium-sized files and `--checksum` (see [Performance](#performance)). |
 
 Mirroring two macOS volume roots typically wants:
 
@@ -135,6 +135,26 @@ the source: in a benchmark with 300,000 files it stayed at about 15 MB (the
 previous whole-tree design needed 230 MB, growing linearly). It grows only
 with the amount of *change* — the list of planned deletions and `--checksum`
 mismatches.
+
+## Performance
+
+Measured against `rsync -a --delete` on an M1 Pro (internal SSD, source and
+target on the same disk, warm cache, dino-copy with its defaults):
+
+| Workload | Run | dino-copy | rsync 3.4.4 | openrsync (macOS) |
+| --- | --- | --- | --- | --- |
+| 300,000 empty files | first | **39.6 s** | 57.9 s | 71.7 s |
+| | nothing changed | **2.0 s** | 8.0 s | 28.1 s |
+| | 1 % changed | **4.6 s** | 8.9 s | 28.8 s |
+| 20,000 × 64 KB (1.3 GB) | first | **5.5 s** | 6.4 s | 8.9 s |
+| | nothing changed | **0.07 s** | 0.15 s | 1.52 s |
+| 8 × 512 MB (4 GB) | first | **1.7 s** | 5.2 s | 15.5 s |
+| 1.3 GB, `--checksum` / `-c` | nothing changed | 1.56 s | **0.78 s** | 9.48 s |
+
+With `--jobs 10` on the same SSD, the 1.3 GB copy takes 4.1 s and the
+checksum run 0.72 s, while the 300,000 tiny files get slower (53 s): parallel
+creation in one directory contends. On USB hard disks the disk dominates the
+copy times, and the differences shrink; the faster scan remains.
 
 ## Development
 

@@ -62,9 +62,14 @@ struct Cli {
     #[arg(long)]
     yes: bool,
 
-    /// Copy parallelism (0 = automatic: SSD=CPUs, HDD/unknown=2).
-    #[arg(long, default_value_t = 0)]
-    jobs: usize,
+    /// Parallel copies and checksum reads.
+    ///
+    /// The default of 2 is safe for hard disks, where more parallel access
+    /// makes the head seek back and forth, and also fastest for many tiny
+    /// files. On SSDs, higher values (e.g. 8) speed up medium-sized files and
+    /// --checksum.
+    #[arg(long, default_value = "2")]
+    jobs: std::num::NonZeroUsize,
 
     /// Scan parallelism (0 = one thread per CPU).
     #[arg(long = "scan-jobs", default_value_t = 0)]
@@ -169,13 +174,11 @@ fn run() -> Result<()> {
         mtime_tol: cli.mtime_window,
     };
 
-    // Determine the copy/hash parallelism once: on macOS is_ssd spawns a
-    // diskutil process, and that must not happen repeatedly.
-    let effective_jobs = if cli.jobs > 0 {
-        cli.jobs
-    } else {
-        sync::default_copy_jobs(&dest_root)
-    };
+    // A fixed default rather than guessing the hardware: whether more
+    // parallelism helps depends more on the data (tiny files get slower) than
+    // on the disk type, and disk detection is unreliable exactly for external
+    // disks behind USB bridges.
+    let effective_jobs = cli.jobs.get();
 
     // With --checksum, pass 1 also verifies every file that looks unchanged by
     // size+mtime via blake3. Only the mismatches are kept (as forced copies).
