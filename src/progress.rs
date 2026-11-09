@@ -1,3 +1,6 @@
+//! Terminal progress display (indicatif): a counter while scanning, and
+//! bytes, files and one status line per copy worker while mirroring.
+
 use crate::sync::ProgressSink;
 use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use std::fmt;
@@ -84,6 +87,48 @@ impl Progress {
         }
         self.files.finish_and_clear();
         self.bytes.finish();
+    }
+}
+
+/// Progress display of the plan pass: a spinner with the number of listed
+/// entries and, with `--checksum`, the number of verified files. The totals
+/// are unknown until the walk is done, so these are counters, not bars.
+pub struct ScanProgressBars {
+    _multi: MultiProgress,
+    entries: ProgressBar,
+    hashed: Option<ProgressBar>,
+}
+
+impl ScanProgressBars {
+    pub fn new(checksum: bool) -> Self {
+        let multi = MultiProgress::new();
+        let entries = multi.add(ProgressBar::new_spinner());
+        entries.set_style(spinner_template("{spin} Scanning: {pos} entries"));
+        entries.enable_steady_tick(Duration::from_millis(SPINNER_FRAME_MS as u64));
+        let hashed = checksum.then(|| {
+            let bar = multi.add(ProgressBar::new_spinner());
+            bar.set_style(ProgressStyle::with_template("  Checksums: {pos} files verified").unwrap());
+            bar
+        });
+        Self { _multi: multi, entries, hashed }
+    }
+
+    pub fn finish(&self) {
+        if let Some(bar) = &self.hashed {
+            bar.finish_and_clear();
+        }
+        self.entries.finish_and_clear();
+    }
+}
+
+impl crate::walk::ScanProgress for ScanProgressBars {
+    fn listed(&self, n: u64) {
+        self.entries.inc(n);
+    }
+    fn hashed(&self) {
+        if let Some(bar) = &self.hashed {
+            bar.inc(1);
+        }
     }
 }
 

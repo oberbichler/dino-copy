@@ -1,4 +1,11 @@
-use std::collections::BTreeMap;
+//! What to do with one directory: the data model of an entry and the
+//! per-directory comparison ([`diff_dir`]) that the walk in [`crate::walk`]
+//! applies to every directory of the tree.
+//!
+//! [`diff_dir`] is a pure function of two sorted listings — no I/O — so the
+//! comparison rules are unit-tested here in isolation.
+
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,6 +16,23 @@ pub enum EntryKind {
     Symlink { target: PathBuf },
 }
 
+/// Identity of a file system object: device and inode number.
+///
+/// Used to recognize when the target file system resolves a name to an entry
+/// that is listed under a different spelling (see [`crate::walk`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct FileId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileId {
+    pub fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self { dev: meta.dev(), ino: meta.ino() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     pub kind: EntryKind,
@@ -17,245 +41,186 @@ pub struct FileEntry {
     pub mtime: i64,
     /// Unix permissions (mode & 0o7777).
     pub mode: u32,
+    pub id: FileId,
 }
 
+/// The entries of ONE directory, sorted by name (byte order). The walker only
+/// ever holds the listings of the directories it is currently processing, so
+/// memory no longer grows with the size of the whole tree.
+pub type Listing = Vec<(OsString, FileEntry)>;
+
+/// What has to happen to one child of a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    /// Remove a blocking target of the wrong type (runs before Create/Copy).
-    RemoveConflict(PathBuf),
-    CreateDir(PathBuf),
-    Copy { rel: PathBuf, size: u64 },
-    /// Create symlink `rel` pointing at `target` (fresh). `mtime` is applied.
-    CreateSymlink { rel: PathBuf, target: PathBuf, mtime: i64 },
-    DeleteFile(PathBuf),
-    DeleteDir(PathBuf),
-    /// Apply a directory's mtime + permissions from the source
-    /// (runs at the very end, deepest first).
-    SetDirMeta { rel: PathBuf, mtime: i64, mode: u32 },
-    /// Align the permissions of a file whose contents are unchanged. chmod on
-    /// the source only changes the ctime, not the mtime — without this action
-    /// pure permission drift would never be mirrored.
-    SetFileMeta { rel: PathBuf, mode: u32 },
+pub enum Op {
+    /// Copy the file contents (new on the target, or size/mtime differ).
+    Copy { size: u64 },
+    /// File counts as unchanged (size + mtime within tolerance). `mode` is set
+    /// when only the permissions differ: chmod on the source only changes the
+    /// ctime, not the mtime — without this pure permission drift would never
+    /// be mirrored. `--checksum` may still turn this into a copy.
+    Same { size: u64, mode: Option<u32> },
+    /// (Re)create a symlink. Recreating is cheap and applies the mtime.
+    Symlink { target: PathBuf, mtime: i64 },
+    /// A source directory. `create` when it is missing on the target (or was
+    /// in the way as a different type); `meta_ok` when the target directory's
+    /// mtime (within tolerance) and mode already match.
+    Dir { mtime: i64, mode: u32, create: bool, meta_ok: bool },
+    /// Exists only on the target: remove it (a directory with its subtree).
+    Remove { is_dir: bool },
+    /// Symlink with the same target and mtime: nothing to do.
+    Keep,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+/// One child of a directory together with its operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Child {
+    pub name: OsString,
+    /// The target holds an entry of a different type under this name. It has
+    /// to be removed (with its subtree) before `op` runs.
+    pub conflict: bool,
+    pub op: Op,
+}
+
+impl Child {
+    /// True when the operation changes the contents of the parent directory
+    /// on the target — and with it the parent's mtime, which then has to be
+    /// reset afterwards. Permission changes (Same with mode) do not count.
+    pub fn touches_parent(&self) -> bool {
+        self.conflict
+            || matches!(
+                self.op,
+                Op::Copy { .. } | Op::Symlink { .. } | Op::Remove { .. } | Op::Dir { create: true, .. }
+            )
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Stats {
+    /// Copied files plus (re)created symlinks.
     pub copy_count: u64,
     pub copy_bytes: u64,
-    pub delete_count: u64,
+    /// Target entries of the wrong type that get replaced.
+    pub conflict_count: u64,
+    /// Target entries without a source counterpart. A directory counts with
+    /// every entry of its subtree.
+    pub remove_count: u64,
     pub mkdir_count: u64,
     pub skip_count: u64,
-    /// Files whose contents are unchanged but whose permissions get aligned
-    /// (SetFileMeta).
+    /// Files whose contents are unchanged but whose permissions get aligned.
     pub meta_count: u64,
+    /// Directories whose mtime/mode get (re)applied.
+    pub dir_meta_count: u64,
+    /// Target entries renamed to the source's spelling (case-only changes on a
+    /// case-insensitive target).
+    pub rename_count: u64,
 }
 
-/// Compares source against dest entries and produces the action list + stats.
-/// `mtime_tol` is the permitted tolerance in seconds.
-/// Action order: CreateDir first (ascending), then Copy, then the deletes
-/// (files before directories, directories descending by depth).
-/// Convenience variant without forced copies (only used by tests; the
-/// production path always goes through [`diff_with_forced`]).
-#[cfg(test)]
-pub fn diff(
-    source: &BTreeMap<PathBuf, FileEntry>,
-    dest: &BTreeMap<PathBuf, FileEntry>,
-    mtime_tol: i64,
-) -> (Vec<Action>, Stats) {
-    diff_with_forced(source, dest, mtime_tol, &std::collections::BTreeSet::new())
+impl Stats {
+    /// Everything that deletes something on the target.
+    pub fn delete_count(&self) -> u64 {
+        self.conflict_count + self.remove_count
+    }
+
+    /// True when the run would not change anything on the target.
+    pub fn is_noop(&self) -> bool {
+        self.copy_count == 0
+            && self.delete_count() == 0
+            && self.mkdir_count == 0
+            && self.meta_count == 0
+            && self.dir_meta_count == 0
+            && self.rename_count == 0
+    }
+
+    pub fn add(&mut self, o: &Stats) {
+        self.copy_count += o.copy_count;
+        self.copy_bytes += o.copy_bytes;
+        self.conflict_count += o.conflict_count;
+        self.remove_count += o.remove_count;
+        self.mkdir_count += o.mkdir_count;
+        self.skip_count += o.skip_count;
+        self.meta_count += o.meta_count;
+        self.dir_meta_count += o.dir_meta_count;
+        self.rename_count += o.rename_count;
+    }
 }
 
-/// Like [`diff`], but files in `forced` are copied even when they count as
-/// unchanged (e.g. because `--checksum` found a mismatch). This makes forced
-/// copies run through the same logic as normal ones (statistics, ordering,
-/// SetDirMeta for touched directories).
-pub fn diff_with_forced(
-    source: &BTreeMap<PathBuf, FileEntry>,
-    dest: &BTreeMap<PathBuf, FileEntry>,
-    mtime_tol: i64,
-    forced: &std::collections::BTreeSet<PathBuf>,
-) -> (Vec<Action>, Stats) {
-    let mut stats = Stats::default();
-    // A target entry "blocks" when it exists but has a different type than the
-    // source entry: it must be removed before Create/Copy.
-    let mut conflicts: Vec<PathBuf> = Vec::new();
-    let mut mkdirs: Vec<PathBuf> = Vec::new();
-    let mut copies: Vec<Action> = Vec::new();
-    let mut symlinks: Vec<Action> = Vec::new();
-    let mut file_metas: Vec<Action> = Vec::new();
-    // All source directories with a flag for whether their metadata already
-    // matches on the target. SetDirMeta is only emitted when the metadata
-    // differs or an action changes the directory's contents (and thus its
-    // mtime).
-    let mut dirs: Vec<(PathBuf, i64, u32, bool)> = Vec::new();
-
-    /// Compares only the type of two kinds (ignoring the symlink target).
-    fn same_type(a: &EntryKind, b: &EntryKind) -> bool {
-        matches!(
-            (a, b),
-            (EntryKind::File, EntryKind::File)
-                | (EntryKind::Dir, EntryKind::Dir)
-                | (EntryKind::Symlink { .. }, EntryKind::Symlink { .. })
-        )
-    }
-
-    for (rel, s) in source {
-        let dest_entry = dest.get(rel);
-        // Wrong type on the target → remove it as a conflict.
-        if let Some(d) = dest_entry {
-            if !same_type(&s.kind, &d.kind) {
-                conflicts.push(rel.clone());
-                stats.delete_count += 1;
-            }
-        }
-        let type_matches = dest_entry.map(|d| same_type(&s.kind, &d.kind)).unwrap_or(false);
-
-        match &s.kind {
-            EntryKind::Dir => {
-                if !type_matches {
-                    mkdirs.push(rel.clone());
-                    stats.mkdir_count += 1;
-                }
-                // Metadata counts as in sync when the target dir exists and
-                // mtime (within tolerance) + mode match.
-                let meta_ok = type_matches
-                    && dest_entry.is_some_and(|d| {
-                        (s.mtime - d.mtime).abs() <= mtime_tol && s.mode == d.mode
-                    });
-                dirs.push((rel.clone(), s.mtime, s.mode, meta_ok));
-            }
-            EntryKind::File => match dest_entry {
-                Some(d)
-                    if type_matches && unchanged(s, d, mtime_tol) && !forced.contains(rel) =>
-                {
-                    stats.skip_count += 1;
-                    // Contents unchanged but permissions differ (chmod only
-                    // changes the ctime): align the metadata instead of copying.
-                    if s.mode != d.mode {
-                        file_metas.push(Action::SetFileMeta { rel: rel.clone(), mode: s.mode });
-                        stats.meta_count += 1;
-                    }
-                }
-                _ => {
-                    copies.push(Action::Copy { rel: rel.clone(), size: s.size });
-                    stats.copy_count += 1;
-                    stats.copy_bytes += s.size;
-                }
-            },
-            EntryKind::Symlink { target } => {
-                // Equal = same target AND mtime within tolerance. Recreating is
-                // cheap and sets the mtime along the way.
-                let same_link = match dest_entry {
-                    Some(d) => match &d.kind {
-                        EntryKind::Symlink { target: dt } => {
-                            dt == target && (s.mtime - d.mtime).abs() <= mtime_tol
-                        }
-                        _ => false,
-                    },
-                    None => false,
-                };
-                if !same_link {
-                    symlinks.push(Action::CreateSymlink {
-                        rel: rel.clone(),
-                        target: target.clone(),
-                        mtime: s.mtime,
-                    });
-                    stats.copy_count += 1;
-                }
-            }
-        }
-    }
-
-    // CreateDir ascending (shallow before deep) so that parents come first.
-    mkdirs.sort_by_key(|p| p.components().count());
-
-    // Set of the conflict paths: RemoveConflict removes the entire subtree, so
-    // descendants must not be deleted on top of that.
-    let conflict_set: std::collections::BTreeSet<PathBuf> = conflicts.iter().cloned().collect();
-    let under_conflict = |rel: &std::path::Path| {
-        rel.ancestors().skip(1).any(|anc| conflict_set.contains(anc))
-    };
-
-    // Deletes: everything on dest that does not exist on source (as the same
-    // type).
-    let mut del_files: Vec<PathBuf> = Vec::new();
-    let mut del_dirs: Vec<PathBuf> = Vec::new();
-    for (rel, d) in dest {
-        let keep = match source.get(rel) {
-            Some(s) => same_type(&s.kind, &d.kind),
-            None => false,
+/// Compares the listings of one directory (source vs. target) by a merge join
+/// over the sorted names. Both listings are consumed.
+pub fn diff_dir(src: Listing, dst: Listing, mtime_tol: i64) -> Vec<Child> {
+    let mut out = Vec::with_capacity(src.len().max(dst.len()));
+    let mut s_it = src.into_iter().peekable();
+    let mut d_it = dst.into_iter().peekable();
+    loop {
+        let order = match (s_it.peek(), d_it.peek()) {
+            (None, None) => break,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some((sn, _)), Some((dn, _))) => sn.cmp(dn),
         };
-        if keep {
-            continue;
-        }
-        // Type conflicts are already covered by RemoveConflict.
-        if source.contains_key(rel) {
-            continue;
-        }
-        // Skip descendants of a removed conflict subtree.
-        if under_conflict(rel) {
-            continue;
-        }
-        match d.kind {
-            EntryKind::File | EntryKind::Symlink { .. } => {
-                del_files.push(rel.clone());
-                stats.delete_count += 1;
+        match order {
+            std::cmp::Ordering::Less => {
+                let (name, s) = s_it.next().unwrap();
+                out.push(Child { name, conflict: false, op: op_for(s, None, mtime_tol) });
             }
-            EntryKind::Dir => {
-                del_dirs.push(rel.clone());
-                stats.delete_count += 1;
+            std::cmp::Ordering::Greater => {
+                let (name, d) = d_it.next().unwrap();
+                let op = Op::Remove { is_dir: d.kind == EntryKind::Dir };
+                out.push(Child { name, conflict: false, op });
+            }
+            std::cmp::Ordering::Equal => {
+                let (name, s) = s_it.next().unwrap();
+                let (_, d) = d_it.next().unwrap();
+                if same_type(&s.kind, &d.kind) {
+                    out.push(Child { name, conflict: false, op: op_for(s, Some(&d), mtime_tol) });
+                } else {
+                    // Wrong type on the target: remove it, then create as new.
+                    out.push(Child { name, conflict: true, op: op_for(s, None, mtime_tol) });
+                }
             }
         }
     }
-    // Directories deepest first.
-    del_dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    out
+}
 
-    // Directories whose contents are changed by an action: that changes their
-    // mtime, so the metadata has to be reset afterwards. What matters is the
-    // direct parent of the changed entry.
-    let mut touched: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
-    let mut touch_parent = |rel: &std::path::Path| {
-        if let Some(parent) = rel.parent() {
-            if !parent.as_os_str().is_empty() {
-                touched.insert(parent.to_path_buf());
+/// Compares only the type of two kinds (ignoring the symlink target).
+fn same_type(a: &EntryKind, b: &EntryKind) -> bool {
+    matches!(
+        (a, b),
+        (EntryKind::File, EntryKind::File)
+            | (EntryKind::Dir, EntryKind::Dir)
+            | (EntryKind::Symlink { .. }, EntryKind::Symlink { .. })
+    )
+}
+
+/// Operation for a source entry. `d` is the target entry of the SAME type, or
+/// None when there is none (missing, or removed as a conflict).
+fn op_for(s: FileEntry, d: Option<&FileEntry>, mtime_tol: i64) -> Op {
+    match s.kind {
+        EntryKind::Dir => Op::Dir {
+            mtime: s.mtime,
+            mode: s.mode,
+            create: d.is_none(),
+            meta_ok: d.is_some_and(|d| (s.mtime - d.mtime).abs() <= mtime_tol && s.mode == d.mode),
+        },
+        EntryKind::File => match d {
+            Some(d) if unchanged(&s, d, mtime_tol) => {
+                Op::Same { size: s.size, mode: (s.mode != d.mode).then_some(s.mode) }
+            }
+            _ => Op::Copy { size: s.size },
+        },
+        EntryKind::Symlink { target } => {
+            // Equal = same target AND mtime within tolerance.
+            let same = d.is_some_and(|d| {
+                matches!(&d.kind, EntryKind::Symlink { target: dt } if *dt == target)
+                    && (s.mtime - d.mtime).abs() <= mtime_tol
+            });
+            if same {
+                Op::Keep
+            } else {
+                Op::Symlink { target, mtime: s.mtime }
             }
         }
-    };
-    for rel in conflicts.iter().chain(&mkdirs).chain(&del_files).chain(&del_dirs) {
-        touch_parent(rel);
     }
-    for a in copies.iter().chain(&symlinks) {
-        match a {
-            Action::Copy { rel, .. } | Action::CreateSymlink { rel, .. } => touch_parent(rel),
-            _ => {}
-        }
-    }
-
-    // Dir metadata deepest first (child writes would otherwise change the
-    // parent's mtime).
-    let mut set_dir_meta: Vec<Action> = dirs
-        .into_iter()
-        .filter(|(rel, _, _, meta_ok)| !meta_ok || touched.contains(rel))
-        .map(|(rel, mtime, mode, _)| Action::SetDirMeta { rel, mtime, mode })
-        .collect();
-    set_dir_meta.sort_by_key(|a| match a {
-        Action::SetDirMeta { rel, .. } => std::cmp::Reverse(rel.components().count()),
-        _ => std::cmp::Reverse(0),
-    });
-
-    let mut actions = Vec::new();
-    // 1. Remove conflicts before targets of the same name are created/copied.
-    actions.extend(conflicts.into_iter().map(Action::RemoveConflict));
-    actions.extend(mkdirs.into_iter().map(Action::CreateDir));
-    actions.extend(copies);
-    actions.extend(symlinks);
-    // Permission alignment of unchanged files (changes no dir mtimes).
-    actions.extend(file_metas);
-    actions.extend(del_files.into_iter().map(Action::DeleteFile));
-    actions.extend(del_dirs.into_iter().map(Action::DeleteDir));
-    // Last: directory metadata (deepest first).
-    actions.extend(set_dir_meta);
-    (actions, stats)
 }
 
 /// True when the dest file counts as unchanged (same size, mtime within
@@ -280,197 +245,141 @@ pub fn hash_file(path: &std::path::Path) -> anyhow::Result<blake3::Hash> {
 mod tests {
     use super::*;
 
-    /// The helpers return (relative path, entry): the path is the map key and
-    /// therefore no longer lives in the FileEntry itself.
-    fn file(rel: &str, size: u64, mtime: i64) -> (PathBuf, FileEntry) {
-        (PathBuf::from(rel), FileEntry { kind: EntryKind::File, size, mtime, mode: 0o644 })
+    fn file(name: &str, size: u64, mtime: i64) -> (OsString, FileEntry) {
+        (name.into(), FileEntry { kind: EntryKind::File, size, mtime, mode: 0o644, id: FileId::default() })
     }
-    fn dir(rel: &str) -> (PathBuf, FileEntry) {
-        (PathBuf::from(rel), FileEntry { kind: EntryKind::Dir, size: 0, mtime: 0, mode: 0o755 })
+    fn dir(name: &str) -> (OsString, FileEntry) {
+        (name.into(), FileEntry { kind: EntryKind::Dir, size: 0, mtime: 0, mode: 0o755, id: FileId::default() })
     }
-    fn symlink(rel: &str, target: &str) -> (PathBuf, FileEntry) {
+    fn symlink(name: &str, target: &str) -> (OsString, FileEntry) {
         (
-            PathBuf::from(rel),
+            name.into(),
             FileEntry {
                 kind: EntryKind::Symlink { target: PathBuf::from(target) },
                 size: 0,
                 mtime: 0,
                 mode: 0o777,
+                id: FileId::default(),
             },
         )
     }
-    fn map(entries: Vec<(PathBuf, FileEntry)>) -> BTreeMap<PathBuf, FileEntry> {
-        entries.into_iter().collect()
-    }
-
-    /// Index of an action in the list (for ordering assertions).
-    fn pos(actions: &[Action], pred: impl Fn(&Action) -> bool) -> Option<usize> {
-        actions.iter().position(pred)
+    fn child(name: &str, conflict: bool, op: Op) -> Child {
+        Child { name: name.into(), conflict, op }
     }
 
     #[test]
     fn copies_new_file() {
-        let s = map(vec![file("a.txt", 10, 100)]);
-        let d = map(vec![]);
-        let (actions, stats) = diff(&s, &d, 1);
-        assert!(actions.contains(&Action::Copy { rel: PathBuf::from("a.txt"), size: 10 }));
-        assert_eq!(stats.copy_count, 1);
-        assert_eq!(stats.copy_bytes, 10);
+        let out = diff_dir(vec![file("a.txt", 10, 100)], vec![], 1);
+        assert_eq!(out, vec![child("a.txt", false, Op::Copy { size: 10 })]);
     }
 
     #[test]
     fn skips_unchanged_file() {
-        let s = map(vec![file("a.txt", 10, 100)]);
-        let d = map(vec![file("a.txt", 10, 100)]);
-        let (actions, stats) = diff(&s, &d, 1);
-        assert!(!actions.iter().any(|a| matches!(a, Action::Copy { .. })));
-        assert_eq!(stats.skip_count, 1);
+        let out = diff_dir(vec![file("a.txt", 10, 100)], vec![file("a.txt", 10, 100)], 1);
+        assert_eq!(out, vec![child("a.txt", false, Op::Same { size: 10, mode: None })]);
+        assert!(!out[0].touches_parent());
     }
 
     #[test]
     fn copies_changed_size() {
-        let s = map(vec![file("a.txt", 20, 100)]);
-        let d = map(vec![file("a.txt", 10, 100)]);
-        let (actions, _) = diff(&s, &d, 1);
-        assert!(actions.contains(&Action::Copy { rel: PathBuf::from("a.txt"), size: 20 }));
+        let out = diff_dir(vec![file("a.txt", 20, 100)], vec![file("a.txt", 10, 100)], 1);
+        assert_eq!(out[0].op, Op::Copy { size: 20 });
     }
 
     #[test]
     fn mtime_within_tolerance_skips() {
-        let s = map(vec![file("a.txt", 10, 100)]);
-        let d = map(vec![file("a.txt", 10, 101)]);
-        let (_, stats) = diff(&s, &d, 1);
-        assert_eq!(stats.skip_count, 1);
+        let out = diff_dir(vec![file("a.txt", 10, 100)], vec![file("a.txt", 10, 101)], 1);
+        assert!(matches!(out[0].op, Op::Same { .. }));
     }
 
     #[test]
     fn mtime_beyond_tolerance_copies() {
-        let s = map(vec![file("a.txt", 10, 100)]);
-        let d = map(vec![file("a.txt", 10, 103)]);
-        let (_, stats) = diff(&s, &d, 1);
-        assert_eq!(stats.copy_count, 1);
+        let out = diff_dir(vec![file("a.txt", 10, 100)], vec![file("a.txt", 10, 103)], 1);
+        assert_eq!(out[0].op, Op::Copy { size: 10 });
     }
 
     #[test]
-    fn mode_only_change_emits_set_file_meta_not_copy() {
-        // chmod on the source only changes the ctime: size+mtime stay the same.
-        // The drift has to be aligned via SetFileMeta, not by copying.
+    fn mode_only_change_is_a_meta_update_not_a_copy() {
         let mut sf = file("a.txt", 10, 100);
         sf.1.mode = 0o600;
-        let df = file("a.txt", 10, 100); // helper: mode 0o644
-        let s = map(vec![sf]);
-        let d = map(vec![df]);
-        let (actions, stats) = diff(&s, &d, 1);
-        assert!(!actions.iter().any(|a| matches!(a, Action::Copy { .. })));
-        assert!(actions.contains(&Action::SetFileMeta {
-            rel: PathBuf::from("a.txt"),
-            mode: 0o600,
-        }));
-        assert_eq!(stats.meta_count, 1);
-        assert_eq!(stats.skip_count, 1, "the file still counts as not copied");
+        let out = diff_dir(vec![sf], vec![file("a.txt", 10, 100)], 1);
+        assert_eq!(out[0].op, Op::Same { size: 10, mode: Some(0o600) });
+        assert!(!out[0].touches_parent(), "chmod does not change the parent's mtime");
     }
 
     #[test]
-    fn equal_mode_emits_no_set_file_meta() {
-        let s = map(vec![file("a.txt", 10, 100)]);
-        let d = map(vec![file("a.txt", 10, 100)]);
-        let (actions, stats) = diff(&s, &d, 1);
-        assert!(actions.is_empty(), "a no-op run must produce no actions: {actions:?}");
-        assert_eq!(stats.meta_count, 0);
-    }
-
-    #[test]
-    fn deletes_extra_file_on_dest() {
-        let s = map(vec![]);
-        let d = map(vec![file("old.txt", 5, 100)]);
-        let (actions, stats) = diff(&s, &d, 1);
-        assert!(actions.contains(&Action::DeleteFile(PathBuf::from("old.txt"))));
-        assert_eq!(stats.delete_count, 1);
+    fn extra_entries_on_dest_are_removed() {
+        let out = diff_dir(vec![], vec![dir("old"), file("old.txt", 5, 100)], 1);
+        assert_eq!(
+            out,
+            vec![
+                child("old", false, Op::Remove { is_dir: true }),
+                child("old.txt", false, Op::Remove { is_dir: false }),
+            ]
+        );
+        assert!(out.iter().all(Child::touches_parent));
     }
 
     #[test]
     fn creates_missing_dir() {
-        let s = map(vec![dir("sub")]);
-        let d = map(vec![]);
-        let (actions, stats) = diff(&s, &d, 1);
-        assert!(actions.contains(&Action::CreateDir(PathBuf::from("sub"))));
-        assert_eq!(stats.mkdir_count, 1);
+        let out = diff_dir(vec![dir("sub")], vec![], 1);
+        assert_eq!(
+            out[0].op,
+            Op::Dir { mtime: 0, mode: 0o755, create: true, meta_ok: false }
+        );
+        assert!(out[0].touches_parent());
     }
 
     #[test]
-    fn deletes_extra_dir_deepest_first() {
-        let s = map(vec![]);
-        let d = map(vec![dir("a"), dir("a/b")]);
-        let (actions, _) = diff(&s, &d, 1);
-        let del: Vec<&Action> = actions.iter().filter(|a| matches!(a, Action::DeleteDir(_))).collect();
-        assert_eq!(del[0], &Action::DeleteDir(PathBuf::from("a/b")));
-        assert_eq!(del[1], &Action::DeleteDir(PathBuf::from("a")));
+    fn existing_dir_with_matching_meta_is_left_alone() {
+        let out = diff_dir(vec![dir("sub")], vec![dir("sub")], 1);
+        assert_eq!(out[0].op, Op::Dir { mtime: 0, mode: 0o755, create: false, meta_ok: true });
+        assert!(!out[0].touches_parent());
     }
 
     #[test]
-    fn file_on_source_dir_on_dest_removes_conflict_before_copy() {
-        // A has file "x", B has directory "x".
-        let s = map(vec![file("x", 3, 100)]);
-        let d = map(vec![dir("x")]);
-        let (actions, _) = diff(&s, &d, 1);
-        let rm = pos(&actions, |a| a == &Action::RemoveConflict(PathBuf::from("x")));
-        let cp = pos(&actions, |a| matches!(a, Action::Copy { rel, .. } if rel == &PathBuf::from("x")));
-        assert!(rm.is_some(), "expected RemoveConflict for x");
-        assert!(cp.is_some(), "expected Copy for x");
-        assert!(rm.unwrap() < cp.unwrap(), "RemoveConflict must run before Copy");
-        // There must be NO DeleteDir(x) (conflict instead of a normal delete).
-        assert!(!actions.contains(&Action::DeleteDir(PathBuf::from("x"))));
+    fn dir_meta_differs_is_detected() {
+        let mut d = dir("sub");
+        d.1.mtime = 999;
+        d.1.mode = 0o700;
+        let out = diff_dir(vec![dir("sub")], vec![d], 1);
+        assert_eq!(out[0].op, Op::Dir { mtime: 0, mode: 0o755, create: false, meta_ok: false });
     }
 
     #[test]
-    fn dir_on_source_file_on_dest_removes_conflict_before_mkdir() {
-        // A has directory "y", B has file "y".
-        let s = map(vec![dir("y")]);
-        let d = map(vec![file("y", 3, 100)]);
-        let (actions, _) = diff(&s, &d, 1);
-        let rm = pos(&actions, |a| a == &Action::RemoveConflict(PathBuf::from("y")));
-        let mk = pos(&actions, |a| a == &Action::CreateDir(PathBuf::from("y")));
-        assert!(rm.is_some() && mk.is_some());
-        assert!(rm.unwrap() < mk.unwrap(), "RemoveConflict must run before CreateDir");
+    fn file_on_source_dir_on_dest_is_a_conflict_then_copy() {
+        let out = diff_dir(vec![file("x", 3, 100)], vec![dir("x")], 1);
+        assert_eq!(out, vec![child("x", true, Op::Copy { size: 3 })]);
+    }
+
+    #[test]
+    fn dir_on_source_file_on_dest_is_a_conflict_then_mkdir() {
+        let out = diff_dir(vec![dir("y")], vec![file("y", 3, 100)], 1);
+        assert!(out[0].conflict);
+        assert!(matches!(out[0].op, Op::Dir { create: true, .. }));
     }
 
     #[test]
     fn new_symlink_is_created() {
-        let s = map(vec![symlink("link", "target")]);
-        let d = map(vec![]);
-        let (actions, stats) = diff(&s, &d, 1);
-        assert!(actions.contains(&Action::CreateSymlink {
-            rel: PathBuf::from("link"),
-            target: PathBuf::from("target"),
-            mtime: 0,
-        }));
-        assert_eq!(stats.copy_count, 1);
+        let out = diff_dir(vec![symlink("link", "target")], vec![], 1);
+        assert_eq!(out[0].op, Op::Symlink { target: PathBuf::from("target"), mtime: 0 });
     }
 
     #[test]
     fn identical_symlink_is_skipped() {
-        let s = map(vec![symlink("link", "target")]);
-        let d = map(vec![symlink("link", "target")]);
-        let (actions, _) = diff(&s, &d, 1);
-        assert!(!actions.iter().any(|a| matches!(a, Action::CreateSymlink { .. })));
+        let out = diff_dir(vec![symlink("link", "target")], vec![symlink("link", "target")], 1);
+        assert_eq!(out[0].op, Op::Keep);
+        assert!(!out[0].touches_parent());
     }
 
     #[test]
     fn symlink_mtime_drift_is_recreated() {
-        // Same link target, but mtime outside the tolerance -> recreate it
-        // (recreating applies the source mtime).
         let mut sl = symlink("link", "target");
         sl.1.mtime = 100;
         let mut dl = symlink("link", "target");
         dl.1.mtime = 500;
-        let s = map(vec![sl]);
-        let d = map(vec![dl]);
-        let (actions, _) = diff(&s, &d, 1);
-        assert!(actions.contains(&Action::CreateSymlink {
-            rel: PathBuf::from("link"),
-            target: PathBuf::from("target"),
-            mtime: 100,
-        }));
+        let out = diff_dir(vec![sl], vec![dl], 1);
+        assert_eq!(out[0].op, Op::Symlink { target: PathBuf::from("target"), mtime: 100 });
     }
 
     #[test]
@@ -479,139 +388,28 @@ mod tests {
         sl.1.mtime = 100;
         let mut dl = symlink("link", "target");
         dl.1.mtime = 101;
-        let s = map(vec![sl]);
-        let d = map(vec![dl]);
-        let (actions, _) = diff(&s, &d, 1);
-        assert!(actions.is_empty(), "within the tolerance: no action, was {actions:?}");
+        let out = diff_dir(vec![sl], vec![dl], 1);
+        assert_eq!(out[0].op, Op::Keep);
     }
 
     #[test]
     fn changed_symlink_target_is_recreated() {
-        let s = map(vec![symlink("link", "new")]);
-        let d = map(vec![symlink("link", "old")]);
-        let (actions, _) = diff(&s, &d, 1);
-        assert!(actions.contains(&Action::CreateSymlink {
-            rel: PathBuf::from("link"),
-            target: PathBuf::from("new"),
-            mtime: 0,
-        }));
+        let out = diff_dir(vec![symlink("link", "new")], vec![symlink("link", "old")], 1);
+        assert_eq!(out[0].op, Op::Symlink { target: PathBuf::from("new"), mtime: 0 });
     }
 
     #[test]
-    fn dir_meta_emitted_deepest_first_and_last() {
-        let mut a_root = dir("a");
-        a_root.1.mtime = 500;
-        a_root.1.mode = 0o700;
-        let mut a_b = dir("a/b");
-        a_b.1.mtime = 600;
-        a_b.1.mode = 0o750;
-        let s = map(vec![a_root, a_b]);
-        let d = map(vec![]);
-        let (actions, _) = diff(&s, &d, 1);
-
-        let metas: Vec<&Action> = actions
-            .iter()
-            .filter(|a| matches!(a, Action::SetDirMeta { .. }))
-            .collect();
-        assert_eq!(metas.len(), 2);
-        // Deepest first.
-        assert_eq!(
-            metas[0],
-            &Action::SetDirMeta { rel: PathBuf::from("a/b"), mtime: 600, mode: 0o750 }
+    fn merge_join_interleaves_both_sides_in_name_order() {
+        let out = diff_dir(
+            vec![file("a", 1, 0), file("c", 1, 0), file("e", 1, 0)],
+            vec![file("b", 1, 0), file("c", 1, 0), file("d", 1, 0)],
+            1,
         );
-        assert_eq!(
-            metas[1],
-            &Action::SetDirMeta { rel: PathBuf::from("a"), mtime: 500, mode: 0o700 }
-        );
-        // SetDirMeta runs after CreateDir.
-        let last_mkdir = actions.iter().rposition(|a| matches!(a, Action::CreateDir(_))).unwrap();
-        let first_meta = pos(&actions, |a| matches!(a, Action::SetDirMeta { .. })).unwrap();
-        assert!(last_mkdir < first_meta);
-    }
-
-    #[test]
-    fn identical_trees_with_subdirs_produce_no_actions() {
-        // A no-op run must produce no actions - otherwise the "nothing to do"
-        // path is unreachable and dir metadata gets rewritten needlessly on
-        // every run (writes on HDDs).
-        let mut sd = dir("sub");
-        sd.1.mtime = 500;
-        sd.1.mode = 0o755;
-        let s = map(vec![sd.clone(), file("sub/a.txt", 10, 100)]);
-        let d = map(vec![sd, file("sub/a.txt", 10, 100)]);
-        let (actions, _) = diff(&s, &d, 1);
-        assert!(actions.is_empty(), "expected no actions, was: {actions:?}");
-    }
-
-    #[test]
-    fn dir_meta_emitted_when_meta_differs() {
-        let mut src_dir = dir("sub");
-        src_dir.1.mtime = 500;
-        src_dir.1.mode = 0o700;
-        let mut dst_dir = dir("sub");
-        dst_dir.1.mtime = 999; // differs
-        dst_dir.1.mode = 0o755; // differs
-        let s = map(vec![src_dir]);
-        let d = map(vec![dst_dir]);
-        let (actions, _) = diff(&s, &d, 1);
-        assert!(actions.contains(&Action::SetDirMeta {
-            rel: PathBuf::from("sub"),
-            mtime: 500,
-            mode: 0o700,
-        }));
-    }
-
-    #[test]
-    fn dir_meta_emitted_when_copy_touches_dir() {
-        // A copy into "sub" changes its mtime -> the metadata has to be reset
-        // afterwards, even though it currently matches.
-        let mut sd = dir("sub");
-        sd.1.mtime = 500;
-        let s = map(vec![sd.clone(), file("sub/new.txt", 10, 100)]);
-        let d = map(vec![sd]);
-        let (actions, _) = diff(&s, &d, 1);
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::SetDirMeta { rel, .. } if rel == &PathBuf::from("sub")
-            )),
-            "expected SetDirMeta for sub, was: {actions:?}"
-        );
-    }
-
-    #[test]
-    fn dir_meta_emitted_when_delete_touches_dir() {
-        let mut sd = dir("sub");
-        sd.1.mtime = 500;
-        let s = map(vec![sd.clone()]);
-        let d = map(vec![sd, file("sub/stale.txt", 10, 100)]);
-        let (actions, _) = diff(&s, &d, 1);
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::SetDirMeta { rel, .. } if rel == &PathBuf::from("sub")
-            )),
-            "expected SetDirMeta for sub, was: {actions:?}"
-        );
-    }
-
-    #[test]
-    fn forced_copy_emits_set_dir_meta_for_parent() {
-        let mut sd = dir("sub");
-        sd.1.mtime = 500;
-        let s = map(vec![sd.clone(), file("sub/a.txt", 10, 100)]);
-        let d = map(vec![sd, file("sub/a.txt", 10, 100)]);
-        let forced: std::collections::BTreeSet<PathBuf> =
-            [PathBuf::from("sub/a.txt")].into_iter().collect();
-        let (actions, stats) = diff_with_forced(&s, &d, 1, &forced);
-        assert_eq!(stats.copy_count, 1, "expected a forced copy: {actions:?}");
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                Action::SetDirMeta { rel, .. } if rel == &PathBuf::from("sub")
-            )),
-            "expected SetDirMeta for sub: {actions:?}"
-        );
+        let names: Vec<_> = out.iter().map(|c| c.name.to_str().unwrap()).collect();
+        assert_eq!(names, ["a", "b", "c", "d", "e"]);
+        assert!(matches!(out[1].op, Op::Remove { .. }));
+        assert!(matches!(out[2].op, Op::Same { .. }));
+        assert!(matches!(out[3].op, Op::Remove { .. }));
     }
 
     #[test]

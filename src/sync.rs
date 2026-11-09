@@ -1,4 +1,7 @@
-use crate::plan::Action;
+//! File system operations on the target: copying a file atomically (temp
+//! file + rename), symlinks, directory metadata, fsync — plus the temp-file
+//! registry that the Ctrl-C handler cleans up.
+
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -331,207 +334,13 @@ fn copy_chunked(
 /// read-only target makes millions of actions fail.
 const MAX_STORED_ERRORS: usize = 100;
 
-fn record_error(errors: &std::sync::Mutex<Vec<String>>, msg: String) {
+pub fn record_error(errors: &std::sync::Mutex<Vec<String>>, msg: String) {
     let mut list = errors.lock().unwrap();
     if list.len() < MAX_STORED_ERRORS {
         list.push(msg);
     } else if list.len() == MAX_STORED_ERRORS {
         list.push("... further errors suppressed".to_string());
     }
-}
-
-/// Runtime options for [`execute`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ExecOptions {
-    /// Copy parallelism (0 = automatic, based on the target volume).
-    pub jobs: usize,
-    /// Write every file with fsync before the rename.
-    pub fsync: bool,
-    /// Delete even when actions failed beforehand.
-    pub ignore_errors: bool,
-}
-
-/// Result of an execution run.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct ExecReport {
-    /// Number of failed actions.
-    pub failed: u64,
-    /// Deletions that were skipped because of earlier errors.
-    pub skipped_deletes: u64,
-}
-
-/// Runs all actions on source_root/dest_root. Copying happens in parallel.
-/// Errors are collected, not fatal; the report states how many there were.
-pub fn execute(
-    source_root: &Path,
-    dest_root: &Path,
-    actions: &[Action],
-    opts: ExecOptions,
-    sink: &dyn ProgressSink,
-    errors: &std::sync::Mutex<Vec<String>>,
-) -> ExecReport {
-    use rayon::prelude::*;
-
-    let failed = AtomicU64::new(0);
-
-    // Phase 0: remove type conflicts on the target (file/dir/symlink of the
-    // wrong type) so that CreateDir/Copy/Symlink do not collide afterwards.
-    for a in actions {
-        if let Action::RemoveConflict(rel) = a {
-            let target = dest_root.join(rel);
-            if let Err(e) = remove_any(&target) {
-                failed.fetch_add(1, Ordering::Relaxed);
-                record_error(errors, format!("remove conflict {}: {e}", target.display()));
-            }
-        }
-    }
-
-    // Phase 1: create directories (serially, respecting the order).
-    for a in actions {
-        if let Action::CreateDir(rel) = a {
-            let target = dest_root.join(rel);
-            if let Err(e) = std::fs::create_dir_all(&target) {
-                failed.fetch_add(1, Ordering::Relaxed);
-                record_error(errors, format!("mkdir {}: {e}", target.display()));
-            }
-        }
-    }
-
-    // Phase 2: copy files in parallel.
-    let copies: Vec<&Action> = actions
-        .iter()
-        .filter(|a| matches!(a, Action::Copy { .. }))
-        .collect();
-
-    let effective_jobs =
-        if opts.jobs > 0 { opts.jobs } else { default_copy_jobs(dest_root) };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(effective_jobs)
-        .build();
-
-    // Copies not yet picked up by any worker. Once this hits zero no worker can
-    // be handed more work, so whoever finishes its current file then is done
-    // for good and its status line can say so — rather than showing a stale
-    // path through the delete and metadata phases that follow.
-    let unclaimed = AtomicU64::new(copies.len() as u64);
-
-    let run_copies = |a: &&Action| {
-        if let Action::Copy { rel, .. } = a {
-            // The path relative to the roots, not the bare file name: with a
-            // deep tree "b.txt" alone says nothing about where the run is.
-            // current_thread_index() is the index inside the pool installed
-            // below, so each copy thread consistently addresses its own line.
-            // Outside a pool (fallback path) everything lands on line 0.
-            let worker = rayon::current_thread_index().unwrap_or(0);
-            unclaimed.fetch_sub(1, Ordering::Relaxed);
-            sink.set_current(worker, &rel.to_string_lossy());
-            let src = source_root.join(rel);
-            let dst = dest_root.join(rel);
-            if let Err(e) = copy_file(&src, &dst, sink, opts.fsync) {
-                failed.fetch_add(1, Ordering::Relaxed);
-                record_error(errors, format!("copy {}: {e}", rel.display()));
-            }
-            if unclaimed.load(Ordering::Relaxed) == 0 {
-                sink.set_done(worker);
-            }
-        }
-    };
-
-    match pool {
-        Ok(p) => p.install(|| copies.par_iter().for_each(run_copies)),
-        Err(_) => copies.par_iter().for_each(run_copies),
-    }
-
-    // Belt and braces: whatever the scheduling was, no copy runs past this
-    // point, so no line may still claim one.
-    for worker in 0..effective_jobs {
-        sink.set_done(worker);
-    }
-
-    // Phase 2b: create symlinks (serially). An existing target is replaced.
-    for a in actions {
-        if let Action::CreateSymlink { rel, target, mtime } = a {
-            let dst = dest_root.join(rel);
-            if let Err(e) = create_symlink(target, &dst, *mtime) {
-                failed.fetch_add(1, Ordering::Relaxed);
-                record_error(errors, format!("symlink {}: {e}", dst.display()));
-            } else {
-                sink.inc_files();
-            }
-        }
-    }
-
-    // Phase 2c: align the permissions of files whose contents are unchanged
-    // (serially; changes no directory mtimes).
-    for a in actions {
-        if let Action::SetFileMeta { rel, mode } = a {
-            let target = dest_root.join(rel);
-            if let Err(e) =
-                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(*mode))
-            {
-                failed.fetch_add(1, Ordering::Relaxed);
-                record_error(errors, format!("set file meta {}: {e}", target.display()));
-            }
-        }
-    }
-
-    // Phase 2d: with --fsync, synchronize the changed directories themselves.
-    // Without that, the rename from phase 2 does not survive a power loss: the
-    // file would be written in full but its directory entry would not — it
-    // would simply be missing.
-    if opts.fsync {
-        for dir in dirs_to_sync(dest_root, actions) {
-            if let Err(e) = sync_dir(&dir) {
-                failed.fetch_add(1, Ordering::Relaxed);
-                record_error(errors, format!("fsync dir {}: {e}", dir.display()));
-            }
-        }
-    }
-
-    // Phase 3: deletes (files before directories, order taken from actions).
-    //
-    // If something failed earlier, the mirror is incomplete: then nothing may
-    // be removed in the target. A file whose source could not be read right now
-    // may be the only remaining reachable version in the target — deleting it
-    // would be the worst possible outcome.
-    let mut skipped_deletes = 0u64;
-    let is_delete = |a: &&Action| matches!(a, Action::DeleteFile(_) | Action::DeleteDir(_));
-    if failed.load(Ordering::Relaxed) > 0 && !opts.ignore_errors {
-        skipped_deletes = actions.iter().filter(is_delete).count() as u64;
-    } else {
-        for a in actions {
-            match a {
-                Action::DeleteFile(rel) => {
-                    let target = dest_root.join(rel);
-                    if let Err(e) = std::fs::remove_file(&target) {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        record_error(errors, format!("rm {}: {e}", target.display()));
-                    }
-                }
-                Action::DeleteDir(rel) => {
-                    let target = dest_root.join(rel);
-                    if let Err(e) = std::fs::remove_dir_all(&target) {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        record_error(errors, format!("rmdir {}: {e}", target.display()));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // Phase 4: set directory metadata (deepest first, order taken from actions).
-    for a in actions {
-        if let Action::SetDirMeta { rel, mtime, mode } = a {
-            let target = dest_root.join(rel);
-            if let Err(e) = set_dir_meta(&target, *mtime, *mode) {
-                failed.fetch_add(1, Ordering::Relaxed);
-                record_error(errors, format!("set dir meta {}: {e}", target.display()));
-            }
-        }
-    }
-
-    ExecReport { failed: failed.load(Ordering::Relaxed), skipped_deletes }
 }
 
 /// Picks a sensible default copy parallelism depending on the target volume.
@@ -584,7 +393,7 @@ fn is_ssd(_path: &Path) -> Option<bool> {
 }
 
 /// Removes a target regardless of its type (file, symlink or directory).
-fn remove_any(path: &Path) -> std::io::Result<()> {
+pub fn remove_any(path: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.is_dir() {
         std::fs::remove_dir_all(path)
@@ -595,7 +404,7 @@ fn remove_any(path: &Path) -> std::io::Result<()> {
 
 /// Creates a symlink `dst` -> `target` and applies the source's mtime.
 /// An existing `dst` is removed beforehand.
-fn create_symlink(target: &Path, dst: &Path, mtime: i64) -> std::io::Result<()> {
+pub fn create_symlink(target: &Path, dst: &Path, mtime: i64) -> std::io::Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -608,42 +417,17 @@ fn create_symlink(target: &Path, dst: &Path, mtime: i64) -> std::io::Result<()> 
     filetime::set_symlink_file_times(dst, ft, ft)
 }
 
-/// Directories whose entries are changed by `actions`.
-///
-/// With `--fsync` these directories have to be synchronized themselves:
-/// `sync_all()` on the temp file only makes its *contents* durable, and the
-/// subsequent `rename` is a directory update. Without an fsync on the
-/// directory, a copied file can be missing after a power loss.
-///
-/// Deletions are left out: if a deleted entry reappears after a crash, the next
-/// run removes it again — that is not data loss.
-fn dirs_to_sync(dest_root: &Path, actions: &[Action]) -> std::collections::BTreeSet<PathBuf> {
-    let mut dirs = std::collections::BTreeSet::new();
-    for a in actions {
-        let rel = match a {
-            Action::Copy { rel, .. }
-            | Action::CreateSymlink { rel, .. }
-            | Action::CreateDir(rel) => rel,
-            _ => continue,
-        };
-        if let Some(parent) = dest_root.join(rel).parent() {
-            dirs.insert(parent.to_path_buf());
-        }
-    }
-    dirs
-}
-
 /// fsync on a directory: makes the `rename` and `mkdir` operations performed
 /// inside it durable.
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
 /// Applies the mode and mtime of the source root directory to the target.
 ///
-/// The root appears in neither map — `scan_tree` skips it — and therefore has
-/// no `SetDirMeta` action. The call has to happen after all writes, because
-/// every change in the target touches its mtime.
+/// The walk never compares the root itself (it starts inside it), so its
+/// metadata is applied separately. The call has to happen after all writes,
+/// because every change in the target touches its mtime.
 pub fn mirror_root_meta(source_root: &Path, dest_root: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(source_root)?;
@@ -673,10 +457,11 @@ pub fn root_meta_differs(source_root: &Path, dest_root: &Path, mtime_tol: i64) -
 /// opens the path (read-only first, write-only as a fallback); a restrictive
 /// mode such as 0o000 — `.Trashes` on macOS volumes, for instance — would
 /// otherwise lock us out of our own target, and the write-only fallback returns
-/// EISDIR on a directory. The reverse ordering is unproblematic because
-/// SetDirMeta runs as the last phase anyway, and within it deepest-first:
-/// nothing needs to be written into an already sealed directory afterwards.
-fn set_dir_meta(dir: &Path, mtime: i64, mode: u32) -> std::io::Result<()> {
+/// EISDIR on a directory. The reverse ordering is unproblematic because the
+/// walk applies a directory's metadata only once its whole subtree is done
+/// (and after the deletions, if any are pending below it): nothing needs to be
+/// written into an already sealed directory afterwards.
+pub fn set_dir_meta(dir: &Path, mtime: i64, mode: u32) -> std::io::Result<()> {
     let ft = filetime::FileTime::from_unix_time(mtime, 0);
     filetime::set_file_mtime(dir, ft)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode))
@@ -685,7 +470,6 @@ fn set_dir_meta(dir: &Path, mtime: i64, mode: u32) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::Action;
     use std::fs;
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
@@ -825,31 +609,6 @@ mod tests {
         assert!(jobs <= cpus.max(2), "jobs unexpectedly high: {jobs}");
     }
 
-    #[test]
-    fn execute_runs_all_action_types() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = tmp.path().join("s");
-        let d = tmp.path().join("d");
-        fs::create_dir_all(s.join("keep")).unwrap();
-        fs::write(s.join("keep/a.txt"), b"aaa").unwrap();
-        fs::create_dir_all(d.join("old")).unwrap();
-        fs::write(d.join("stale.txt"), b"x").unwrap();
-
-        let actions = vec![
-            Action::CreateDir(PathBuf::from("keep")),
-            Action::Copy { rel: PathBuf::from("keep/a.txt"), size: 3 },
-            Action::DeleteFile(PathBuf::from("stale.txt")),
-            Action::DeleteDir(PathBuf::from("old")),
-        ];
-        let errors = Mutex::new(Vec::new());
-        let report = execute(&s, &d, &actions, ExecOptions { jobs: 2, ..Default::default() }, &NullSink, &errors);
-
-        assert_eq!(report.failed, 0);
-        assert_eq!(fs::read(d.join("keep/a.txt")).unwrap(), b"aaa");
-        assert!(!d.join("stale.txt").exists());
-        assert!(!d.join("old").exists());
-    }
-
     /// Sink that sums up the reported bytes.
     #[derive(Default)]
     struct ByteSpy {
@@ -862,114 +621,6 @@ mod tests {
         fn set_current(&self, _worker: usize, _name: &str) {}
         fn set_done(&self, _worker: usize) {}
         fn inc_files(&self) {}
-    }
-
-    /// Sink that records the (worker, name) pairs passed to set_current and
-    /// which workers were reported as done.
-    #[derive(Default)]
-    struct NameSpy {
-        names: Mutex<Vec<(usize, String)>>,
-        done: Mutex<std::collections::BTreeSet<usize>>,
-    }
-    impl ProgressSink for NameSpy {
-        fn add_bytes(&self, _n: u64) {}
-        fn set_current(&self, worker: usize, name: &str) {
-            self.names.lock().unwrap().push((worker, name.to_string()));
-        }
-        fn set_done(&self, worker: usize) {
-            self.done.lock().unwrap().insert(worker);
-        }
-        fn inc_files(&self) {}
-    }
-
-    #[test]
-    fn every_busy_worker_is_reported_done_once_the_copies_are_over() {
-        // Otherwise a worker's line keeps showing its last file through the
-        // delete and metadata phases, which can run for a long time.
-        let tmp = tempfile::tempdir().unwrap();
-        let s = tmp.path().join("s");
-        let d = tmp.path().join("d");
-        fs::create_dir_all(&s).unwrap();
-        let mut actions = Vec::new();
-        for i in 0..12 {
-            let name = format!("f{i}.txt");
-            fs::write(s.join(&name), b"x").unwrap();
-            actions.push(Action::Copy { rel: PathBuf::from(&name), size: 1 });
-        }
-
-        let spy = NameSpy::default();
-        let errors = Mutex::new(Vec::new());
-        let report =
-            execute(&s, &d, &actions, ExecOptions { jobs: 2, ..Default::default() }, &spy, &errors);
-
-        assert_eq!(report.failed, 0, "errors: {:?}", errors.lock().unwrap());
-        let busy: std::collections::BTreeSet<usize> =
-            spy.names.lock().unwrap().iter().map(|(w, _)| *w).collect();
-        let done = spy.done.lock().unwrap().clone();
-        assert!(!busy.is_empty(), "at least one worker must have copied something");
-        assert!(
-            busy.is_subset(&done),
-            "every worker that showed a file must end up done: busy={busy:?} done={done:?}"
-        );
-    }
-
-    #[test]
-    fn each_copy_is_announced_with_its_worker_index() {
-        // With one status line per worker, every copy has to say WHICH worker
-        // it belongs to — otherwise parallel copies overwrite each other's line
-        // and the display jumps between directories.
-        let tmp = tempfile::tempdir().unwrap();
-        let s = tmp.path().join("s");
-        let d = tmp.path().join("d");
-        fs::create_dir_all(&s).unwrap();
-        let mut actions = Vec::new();
-        for i in 0..12 {
-            let name = format!("f{i}.txt");
-            fs::write(s.join(&name), b"x").unwrap();
-            actions.push(Action::Copy { rel: PathBuf::from(&name), size: 1 });
-        }
-
-        let spy = NameSpy::default();
-        let errors = Mutex::new(Vec::new());
-        let report =
-            execute(&s, &d, &actions, ExecOptions { jobs: 2, ..Default::default() }, &spy, &errors);
-
-        assert_eq!(report.failed, 0, "errors: {:?}", errors.lock().unwrap());
-        let seen = spy.names.lock().unwrap();
-        assert_eq!(seen.len(), 12, "every copy must be announced");
-        assert!(
-            seen.iter().all(|(worker, _)| *worker < 2),
-            "worker indices must stay inside the pool of 2: {seen:?}"
-        );
-    }
-
-    #[test]
-    fn progress_reports_the_path_relative_to_the_source_root() {
-        // The progress line has to show where in the tree the copy is. A bare
-        // file name is useless when every directory holds a "b.txt".
-        let tmp = tempfile::tempdir().unwrap();
-        let s = tmp.path().join("s");
-        let d = tmp.path().join("d");
-        fs::create_dir_all(s.join("sub/deep")).unwrap();
-        fs::write(s.join("sub/deep/b.txt"), b"x").unwrap();
-
-        let actions = vec![
-            Action::CreateDir(PathBuf::from("sub")),
-            Action::CreateDir(PathBuf::from("sub/deep")),
-            Action::Copy { rel: PathBuf::from("sub/deep/b.txt"), size: 1 },
-        ];
-        let spy = NameSpy::default();
-        let errors = Mutex::new(Vec::new());
-        let report =
-            execute(&s, &d, &actions, ExecOptions { jobs: 1, ..Default::default() }, &spy, &errors);
-
-        assert_eq!(report.failed, 0, "errors: {:?}", errors.lock().unwrap());
-        let seen = spy.names.lock().unwrap();
-        assert_eq!(
-            seen.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(),
-            ["sub/deep/b.txt"],
-            "progress must report the path relative to the source root"
-        );
     }
 
     /// Sink that collects the temp file's permissions on the first chunk.
@@ -1097,36 +748,6 @@ mod tests {
     }
 
     #[test]
-    fn source_file_named_like_temp_is_not_clobbered() {
-        // The source contains a file that looks like a dino-copy temp name.
-        // With deterministic temp names the temp path of the "foo" copy would
-        // be identical to the target path of ".dino-copy.tmp.foo" -> the file
-        // would disappear.
-        let tmp = tempfile::tempdir().unwrap();
-        let s = tmp.path().join("s");
-        let d = tmp.path().join("d");
-        fs::create_dir_all(&s).unwrap();
-        fs::create_dir_all(&d).unwrap();
-        fs::write(s.join(".dino-copy.tmp.foo"), b"i am a real file").unwrap();
-        fs::write(s.join("foo"), b"foo-content").unwrap();
-
-        let actions = vec![
-            Action::Copy { rel: PathBuf::from(".dino-copy.tmp.foo"), size: 16 },
-            Action::Copy { rel: PathBuf::from("foo"), size: 11 },
-        ];
-        let errors = Mutex::new(Vec::new());
-        let report = execute(&s, &d, &actions, ExecOptions { jobs: 1, ..Default::default() }, &NullSink, &errors);
-
-        assert_eq!(report.failed, 0, "errors: {:?}", errors.lock().unwrap());
-        assert_eq!(fs::read(d.join("foo")).unwrap(), b"foo-content");
-        assert_eq!(
-            fs::read(d.join(".dino-copy.tmp.foo")).unwrap(),
-            b"i am a real file",
-            "a file with a temp-like name must not be overwritten/moved"
-        );
-    }
-
-    #[test]
     fn failed_copy_leaves_no_temp_file() {
         // The dst parent is a file → create_dir_all(parent) fails, no temp file
         // may be left behind and the registry must be empty.
@@ -1158,41 +779,5 @@ mod tests {
         fs::write(tmp.path().join("a.txt"), b"x").unwrap();
 
         sync_dir(tmp.path()).expect("fsync on a directory must work");
-    }
-
-    #[test]
-    fn dirs_to_sync_collects_parents_of_created_entries() {
-        let dest = PathBuf::from("/target");
-        let actions = vec![
-            Action::Copy { rel: PathBuf::from("sub/a.txt"), size: 1 },
-            Action::Copy { rel: PathBuf::from("b.txt"), size: 1 },
-            Action::CreateSymlink {
-                rel: PathBuf::from("sub/link"),
-                target: PathBuf::from("a.txt"),
-                mtime: 0,
-            },
-            Action::CreateDir(PathBuf::from("new")),
-        ];
-
-        let dirs = dirs_to_sync(&dest, &actions);
-
-        // sub appears twice and must only be synchronized once.
-        assert_eq!(
-            dirs.into_iter().collect::<Vec<_>>(),
-            vec![PathBuf::from("/target"), PathBuf::from("/target/sub")]
-        );
-    }
-
-    #[test]
-    fn dirs_to_sync_ignores_actions_that_create_nothing() {
-        let dest = PathBuf::from("/target");
-        let actions = vec![
-            Action::DeleteFile(PathBuf::from("gone.txt")),
-            Action::DeleteDir(PathBuf::from("gone")),
-            Action::SetFileMeta { rel: PathBuf::from("a.txt"), mode: 0o644 },
-            Action::SetDirMeta { rel: PathBuf::from("sub"), mtime: 0, mode: 0o755 },
-        ];
-
-        assert!(dirs_to_sync(&dest, &actions).is_empty());
     }
 }
