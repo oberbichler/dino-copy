@@ -22,3 +22,7 @@ pr-run-mode = "plan"
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+
+# GitHub retired the macos-14 arm64 image that dist 0.32 picks by default.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
