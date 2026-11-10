@@ -3,6 +3,7 @@
 // scan onto an empty disk (hundreds of thousands of entries) stays smooth.
 
 import * as fmt from "./format";
+import { t } from "./i18n";
 
 /** One planned change, as sent by the backend (compact field names). */
 export interface ScanItem {
@@ -142,8 +143,8 @@ export class ScanView {
     }
     this.status.textContent =
       items.length === this.items.length
-        ? fmt.plural(items.length, "change")
-        : `${fmt.count(items.length)} of ${fmt.plural(this.items.length, "change")}`;
+        ? t("changes", { n: items.length })
+        : t("shownOf", { shown: items.length, total: t("changes", { n: this.items.length }) });
     this.spacer.style.height = `${this.rows.length * ROW_HEIGHT}px`;
     this.draw();
   }
@@ -158,7 +159,7 @@ export class ScanView {
     const html: string[] = [];
     for (let i = first; i < last; i++) html.push(renderRow(this.rows[i], i));
     if (this.rows.length === 0) {
-      html.push(`<div class="rows-empty">${this.items.length === 0 ? "No changes." : "Nothing matches."}</div>`);
+      html.push(`<div class="rows-empty">${this.items.length === 0 ? t("noChanges") : t("nothingMatches")}</div>`);
     }
     // The spacer gives the scrollbar its full height; rows sit on top of it.
     this.spacer.innerHTML = html.join("");
@@ -239,9 +240,9 @@ function flatten(node: Node, out: Row[], isOpen: (n: Node) => boolean): void {
 }
 
 function folderTag(it: ScanItem): string {
-  if (it.k === "m") return "new folder";
-  if (it.k === "x") return "replaces a file";
-  if (it.k === "r") return `renamed from ${escapeHtml(it.from ?? "")}`;
+  if (it.k === "m") return t("newFolder");
+  if (it.k === "x") return t("replacesFile");
+  if (it.k === "r") return t("renamedFrom", { name: escapeHtml(it.from ?? "") });
   return "";
 }
 
@@ -258,19 +259,19 @@ function itemRow(it: ScanItem, label: string, depth: number): Row {
     case "c":
       return { depth, label, sign: "copy", detail: fmt.bytes(it.n), title: it.p };
     case "m":
-      return { depth, label: `${label}/`, sign: "copy", detail: "new folder", title: it.p };
+      return { depth, label: `${label}/`, sign: "copy", detail: t("newFolder"), title: it.p };
     case "d":
       return {
         depth,
         label: it.dir ? `${label}/` : label,
         sign: "delete",
-        detail: it.dir ? `whole folder, ${fmt.plural(it.n, "entry", "entries")}` : "",
+        detail: it.dir ? t("wholeFolder", { entries: t("entries", { n: it.n }) }) : "",
         title: it.p,
       };
     case "x":
-      return { depth, label, sign: "delete", detail: "replaced (other type on the target)", title: it.p };
+      return { depth, label, sign: "delete", detail: t("replacedOther"), title: it.p };
     case "r":
-      return { depth, label, sign: "rename", detail: `renamed from ${escapeHtml(it.from ?? "")}`, title: it.p };
+      return { depth, label, sign: "rename", detail: t("renamedFrom", { name: escapeHtml(it.from ?? "") }), title: it.p };
   }
 }
 

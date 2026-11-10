@@ -166,6 +166,11 @@ changing anything. The app uses the same engine and the same safety rules as
 the command line tool, and it leaves out the folders macOS keeps on every
 volume (`.Spotlight-V100`, `.fseventsd`, `.Trashes`, …).
 
+The window follows the system language: English, German, French, Spanish,
+Italian, Dutch, Polish and Portuguese. Translations live in `app/src/i18n/`;
+English defines the keys, and the type check fails if a language misses one.
+The icon is drawn in `app/icon/icon.svg`.
+
 It is not released yet. To run it from source (Node.js and Rust required):
 
 ```sh

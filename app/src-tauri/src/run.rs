@@ -132,15 +132,48 @@ struct ScanItem {
     from: Option<String>,
 }
 
+/// Something to tell the user. The window turns it into a sentence in the
+/// user's language; only [`Msg::Detail`] carries text as it is (warnings and
+/// I/O errors from the engine, which name paths and system errors).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "key", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum Msg {
+    // Why a pair cannot be started.
+    SourceMissing { path: String },
+    TargetMissing { path: String },
+    Unresolvable { path: String },
+    Identical,
+    TargetInsideSource,
+    SourceInsideTarget,
+    RunInProgress,
+    // Headlines.
+    CancelledUnchanged,
+    SourceEmpty { entries: u64 },
+    ScanNothingToDo,
+    ScanFinished,
+    InSync,
+    CancelledPartly,
+    FinishedWithErrors { count: u64 },
+    FinishedIncomplete,
+    Mirrored { target: String, source: String },
+    // Further messages.
+    DeletionsWillBeSkipped { count: u64, unreadable: u64, collisions: u64 },
+    RootMetaFailed { error: String },
+    SkippedAfterFailures { count: u64 },
+    SkippedUnreadable { count: u64 },
+    SkippedChanged { count: u64 },
+    Detail { text: String },
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RunResult {
     mode: Mode,
     outcome: Outcome,
     /// One line for the headline.
-    headline: String,
+    headline: Msg,
     /// Errors and warnings worth showing (capped at [`MAX_MESSAGES`]).
-    messages: Vec<String>,
+    messages: Vec<Msg>,
     summary: Summary,
     duration_secs: f64,
     /// Planned changes (scan only).
@@ -153,14 +186,33 @@ struct RunResult {
 // ---------------------------------------------------------------------------
 
 /// Why `source` → `target` cannot be started.
-pub fn check_pair(source: &Path, target: &Path) -> Result<(), String> {
+pub fn check_pair(source: &Path, target: &Path) -> Result<(), Msg> {
     if !source.is_dir() {
-        return Err(format!("Source is not available: {}", source.display()));
+        return Err(Msg::SourceMissing {
+            path: source.display().to_string(),
+        });
     }
     if !target.is_dir() {
-        return Err(format!("Target is not available: {}", target.display()));
+        return Err(Msg::TargetMissing {
+            path: target.display().to_string(),
+        });
     }
-    guard::check_disjoint(source, target).map_err(|e| e.to_string())
+    // The same rules as `guard::check_disjoint`, told apart for the window.
+    let resolve = |p: &Path| {
+        guard::resolve_existing(p).map_err(|_| Msg::Unresolvable {
+            path: p.display().to_string(),
+        })
+    };
+    let (src, dst) = (resolve(source)?, resolve(target)?);
+    if src == dst {
+        Err(Msg::Identical)
+    } else if dst.starts_with(&src) {
+        Err(Msg::TargetInsideSource)
+    } else if src.starts_with(&dst) {
+        Err(Msg::SourceInsideTarget)
+    } else {
+        Ok(())
+    }
 }
 
 pub fn start(
@@ -169,13 +221,13 @@ pub fn start(
     mode: Mode,
     source: PathBuf,
     target: PathBuf,
-) -> Result<(), String> {
+) -> Result<(), Msg> {
     check_pair(&source, &target)?;
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut current = state.current.lock().unwrap();
         if current.is_some() {
-            return Err("A run is already in progress.".into());
+            return Err(Msg::RunInProgress);
         }
         *current = Some(cancel.clone());
     }
@@ -184,12 +236,13 @@ pub fn start(
         .spawn(move || {
             let _awake = KeepAwake::start();
             let result = run(&app, mode, &source, &target, &cancel);
-            notify(&app, &result);
             use tauri::Manager;
             app.state::<RunState>().current.lock().unwrap().take();
             let _ = app.emit("run://done", result);
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Msg::Detail {
+            text: e.to_string(),
+        })?;
     Ok(())
 }
 
@@ -214,7 +267,7 @@ fn run<R: Runtime>(
         mtime_tol: 2,
         cancel: Some(cancel),
     };
-    let finish = |outcome, headline: String, messages, summary, items| RunResult {
+    let finish = |outcome, headline: Msg, messages, summary, items| RunResult {
         mode,
         outcome,
         headline,
@@ -242,7 +295,7 @@ fn run<R: Runtime>(
     if plan.cancelled {
         return finish(
             Outcome::Cancelled,
-            "Cancelled. Nothing was changed.".into(),
+            Msg::CancelledUnchanged,
             messages,
             summary,
             None,
@@ -254,10 +307,9 @@ fn run<R: Runtime>(
     if plan.source_empty && target_entries > 0 {
         return finish(
             Outcome::Failed,
-            format!(
-                "The source is empty, but the target holds {target_entries} entries. \
-                 Nothing was changed: this looks like a disk that is not mounted."
-            ),
+            Msg::SourceEmpty {
+                entries: target_entries,
+            },
             messages,
             summary,
             None,
@@ -265,19 +317,19 @@ fn run<R: Runtime>(
     }
     let deletions_allowed = plan.deletions_allowed(false);
     if !deletions_allowed && plan.stats.remove_count > 0 {
-        messages.push(format!(
-            "{} deletion(s) will be skipped: {}.",
-            plan.stats.remove_count,
-            incomplete_reason(&plan)
-        ));
+        messages.push(Msg::DeletionsWillBeSkipped {
+            count: plan.stats.remove_count,
+            unreadable: plan.unreadable,
+            collisions: plan.collisions,
+        });
     }
 
     if mode == Mode::Scan {
         let items = scan_items(&plan);
         let headline = if plan.stats.is_noop() {
-            "Nothing to do: the target already mirrors the source.".into()
+            Msg::ScanNothingToDo
         } else {
-            "Scan finished. Nothing was changed.".into()
+            Msg::ScanFinished
         };
         return finish(Outcome::Scanned, headline, messages, summary, Some(items));
     }
@@ -290,7 +342,7 @@ fn run<R: Runtime>(
         };
         return finish(
             outcome,
-            "Already in sync. Nothing to do.".into(),
+            Msg::InSync,
             messages,
             summary,
             None,
@@ -327,15 +379,21 @@ fn run<R: Runtime>(
     if !report.cancelled
         && let Err(e) = sync::mirror_root_meta(src, dst)
     {
-        messages.push(format!("Target folder metadata not applied: {e}"));
+        messages.push(Msg::RootMetaFailed {
+            error: e.to_string(),
+        });
     }
 
     let errs = errors.into_inner().unwrap();
-    messages.extend(errs.iter().take(MAX_MESSAGES).cloned());
+    messages.extend(
+        errs.iter()
+            .take(MAX_MESSAGES)
+            .map(|text| Msg::Detail { text: text.clone() }),
+    );
     if let Some(reason) = report.skip_reason
-        && let Some(text) = skip_text(reason, &report)
+        && let Some(msg) = skip_msg(reason, report.skipped_deletes)
     {
-        messages.push(text);
+        messages.push(msg);
     }
     let mut summary = summary;
     if report.skip_reason.is_some() {
@@ -343,29 +401,25 @@ fn run<R: Runtime>(
     }
 
     let (outcome, headline) = if report.cancelled {
-        (
-            Outcome::Cancelled,
-            "Cancelled. Files copied so far are complete; nothing was deleted.".to_string(),
-        )
+        (Outcome::Cancelled, Msg::CancelledPartly)
     } else if report.failed > 0 {
         (
             Outcome::Incomplete,
-            format!(
-                "Finished with {} error(s). The target is not a complete mirror.",
-                report.failed
-            ),
+            Msg::FinishedWithErrors {
+                count: report.failed,
+            },
         )
     } else if report.skip_reason.is_some()
         || plan.unreadable + plan.collisions + report.unreadable > 0
     {
-        (
-            Outcome::Incomplete,
-            "Finished, but the target is not a complete mirror.".to_string(),
-        )
+        (Outcome::Incomplete, Msg::FinishedIncomplete)
     } else {
         (
             Outcome::Success,
-            format!("{} now mirrors {}.", name_of(dst), name_of(src)),
+            Msg::Mirrored {
+                target: name_of(dst),
+                source: name_of(src),
+            },
         )
     };
     messages.truncate(MAX_MESSAGES);
@@ -383,27 +437,12 @@ fn summary_of(plan: &Plan) -> Summary {
     }
 }
 
-fn incomplete_reason(plan: &Plan) -> String {
-    match (plan.unreadable, plan.collisions) {
-        (u, 0) => format!("{u} folder(s) could not be read"),
-        (0, c) => format!("{c} name(s) cannot be told apart on the target"),
-        (u, c) => format!("{u} folder(s) could not be read and {c} name(s) collide"),
-    }
-}
-
-fn skip_text(reason: SkipReason, report: &walk::ExecReport) -> Option<String> {
-    let n = report.skipped_deletes;
+fn skip_msg(reason: SkipReason, count: u64) -> Option<Msg> {
     Some(match reason {
         SkipReason::Cancelled => return None,
-        SkipReason::FailedActions => {
-            format!("{n} deletion(s) skipped because other actions failed.")
-        }
-        SkipReason::Unreadable => {
-            format!("{n} deletion(s) skipped because folders could not be read.")
-        }
-        SkipReason::Unplanned { .. } => format!(
-            "{n} deletion(s) skipped: the source or target changed during the run. Run again."
-        ),
+        SkipReason::FailedActions => Msg::SkippedAfterFailures { count },
+        SkipReason::Unreadable => Msg::SkippedUnreadable { count },
+        SkipReason::Unplanned { .. } => Msg::SkippedChanged { count },
     })
 }
 
@@ -466,18 +505,6 @@ fn phase<R: Runtime>(app: &AppHandle<R>, phase: Phase) {
     let _ = app.emit("run://phase", phase);
 }
 
-fn notify(app: &AppHandle, result: &RunResult) {
-    use tauri_plugin_notification::NotificationExt;
-    if result.mode == Mode::Mirror {
-        let _ = app
-            .notification()
-            .builder()
-            .title("dino-copy")
-            .body(&result.headline)
-            .show();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Observers
 // ---------------------------------------------------------------------------
@@ -487,7 +514,7 @@ struct Observer<'a, R: Runtime> {
     app: &'a AppHandle<R>,
     listed: AtomicU64,
     last_emit: Mutex<Instant>,
-    warnings: Mutex<Vec<String>>,
+    warnings: Mutex<Vec<Msg>>,
 }
 
 impl<'a, R: Runtime> Observer<'a, R> {
@@ -500,7 +527,7 @@ impl<'a, R: Runtime> Observer<'a, R> {
         }
     }
 
-    fn take_warnings(&self) -> Vec<String> {
+    fn take_warnings(&self) -> Vec<Msg> {
         std::mem::take(&mut *self.warnings.lock().unwrap())
     }
 }
@@ -518,7 +545,9 @@ impl<R: Runtime> PlanObserver for Observer<'_, R> {
     fn warning(&self, msg: &str) {
         let mut w = self.warnings.lock().unwrap();
         if w.len() < MAX_MESSAGES {
-            w.push(msg.to_string());
+            w.push(Msg::Detail {
+                text: msg.to_string(),
+            });
         }
     }
 }
@@ -675,8 +704,9 @@ mod tests {
         std::fs::create_dir(&a).unwrap();
         std::fs::create_dir(a.join("inner")).unwrap();
 
-        assert!(check_pair(&a, &a.join("inner")).is_err());
-        assert!(check_pair(&a, &a).is_err());
+        assert_eq!(check_pair(&a, &a.join("inner")), Err(Msg::TargetInsideSource));
+        assert_eq!(check_pair(&a.join("inner"), &a), Err(Msg::SourceInsideTarget));
+        assert_eq!(check_pair(&a, &a), Err(Msg::Identical));
         assert!(check_pair(&a, &tmp.path().join("missing")).is_err());
         let b = tmp.path().join("b");
         std::fs::create_dir(&b).unwrap();
@@ -735,7 +765,7 @@ mod tests {
 
         let (r, phases) = run_mock(&t, Mode::Mirror, false);
 
-        assert!(matches!(r.outcome, Outcome::Success), "{}: {:?}", r.headline, r.messages);
+        assert!(matches!(r.outcome, Outcome::Success), "{:?}: {:?}", r.headline, r.messages);
         assert_eq!(fs::read(t.dst.join("photos/a.jpg")).unwrap(), b"aaaa");
         assert!(!t.dst.join("stale.txt").exists());
         assert_eq!(r.summary.copy_count, 2);
@@ -750,7 +780,7 @@ mod tests {
 
         let (r, _) = run_mock(&t, Mode::Mirror, false);
 
-        assert!(matches!(r.outcome, Outcome::InSync), "{}", r.headline);
+        assert!(matches!(r.outcome, Outcome::InSync), "{:?}", r.headline);
     }
 
     #[test]
@@ -789,8 +819,8 @@ mod tests {
 
         let (r, _) = run_mock(&t, Mode::Mirror, false);
 
-        assert!(matches!(r.outcome, Outcome::Failed), "{}", r.headline);
-        assert!(r.headline.contains("not mounted"), "{}", r.headline);
+        assert!(matches!(r.outcome, Outcome::Failed), "{:?}", r.headline);
+        assert!(matches!(r.headline, Msg::SourceEmpty { .. }), "{:?}", r.headline);
         assert!(t.dst.join("stale.txt").exists());
     }
 
@@ -804,7 +834,7 @@ mod tests {
 
         let (r, _) = run_mock(&t, Mode::Mirror, false);
 
-        assert!(matches!(r.outcome, Outcome::Success), "{}: {:?}", r.headline, r.messages);
+        assert!(matches!(r.outcome, Outcome::Success), "{:?}: {:?}", r.headline, r.messages);
         assert!(!t.dst.join(".fseventsd").exists(), "not copied");
         assert!(t.dst.join(".Spotlight-V100/index").exists(), "not deleted");
     }
@@ -816,4 +846,34 @@ mod tests {
         assert!(f.excludes(Path::new(".Spotlight-V100")));
         assert!(!f.excludes(Path::new("Photos")));
     }
+
+    /// The window translates messages by `key` and reads their fields by
+    /// these names (see `msgText` in `app/src/main.ts`).
+    #[test]
+    fn messages_reach_the_window_as_key_and_camel_case_fields() {
+        let json = |m: Msg| serde_json::to_value(m).unwrap();
+        assert_eq!(json(Msg::Identical), serde_json::json!({ "key": "identical" }));
+        assert_eq!(
+            json(Msg::Mirrored {
+                target: "B".into(),
+                source: "A".into()
+            }),
+            serde_json::json!({ "key": "mirrored", "target": "B", "source": "A" })
+        );
+        assert_eq!(
+            json(Msg::DeletionsWillBeSkipped {
+                count: 3,
+                unreadable: 1,
+                collisions: 0
+            }),
+            serde_json::json!({
+                "key": "deletionsWillBeSkipped", "count": 3, "unreadable": 1, "collisions": 0
+            })
+        );
+        assert_eq!(
+            json(Msg::SourceEmpty { entries: 2 }),
+            serde_json::json!({ "key": "sourceEmpty", "entries": 2 })
+        );
+    }
+
 }

@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- dino-copy app icon: a dino and its mirror image. Source for `tauri icon`
+       (render with render.mjs, then `npx tauri icon icon.png`). -->
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d9f1ff"/>
+      <stop offset="1" stop-color="#a6d8f5"/>
+    </linearGradient>
+    <filter id="drop" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.22"/>
+    </filter>
+    <clipPath id="tile">
+      <rect x="100" y="100" width="824" height="824" rx="185"/>
+    </clipPath>
+    <!-- One dino, facing right. -->
+    <path id="silhouette" d="
+      M 560 250
+      C 640 215, 785 225, 800 305
+      C 812 370, 790 425, 730 438
+      C 690 446, 650 446, 625 452
+      C 640 520, 655 590, 645 660
+      C 640 712, 625 750, 610 770
+      L 612 812
+      C 613 832, 600 842, 582 842
+      L 550 842
+      C 532 842, 522 830, 524 812
+      L 526 790
+      C 505 793, 490 793, 470 792
+      L 472 812
+      C 473 832, 460 842, 442 842
+      L 410 842
+      C 392 842, 382 830, 384 812
+      L 388 770
+      C 370 762, 355 755, 340 750
+      C 290 742, 220 748, 150 772
+      C 205 725, 285 690, 340 660
+      C 380 630, 410 560, 430 500
+      C 450 420, 470 330, 500 285
+      C 515 265, 535 255, 560 250 Z"/>
+    <g id="dino">
+    <!-- shadow -->
+    <ellipse cx="500" cy="846" rx="190" ry="18" fill="#000" fill-opacity="0.12"/>
+
+    <!-- the original -->
+    <use href="#silhouette" fill="#9fcb1f"/>
+    <!-- belly -->
+    <path d="M 625 452 C 640 520, 655 590, 645 660 C 640 712, 625 750, 600 772 C 600 700, 590 600, 560 520 C 575 490, 600 465, 625 452 Z" fill="#c7e05a"/>
+    <!-- far leg shading -->
+    <path d="M 470 792 C 490 793, 505 793, 526 790 L 524 812 C 522 830, 532 842, 550 842 L 582 842 C 600 842, 613 832, 612 812 L 610 770 C 585 785, 520 795, 470 792 Z" fill="#000" fill-opacity="0.08"/>
+    <!-- thigh -->
+    <path d="M 380 690 C 400 620, 500 610, 530 680 C 550 730, 520 780, 470 790 C 420 792, 370 750, 380 690 Z" fill="#8bb914"/>
+    <!-- spots -->
+    <ellipse cx="455" cy="590" rx="30" ry="24" fill="#e3e83a"/>
+    <ellipse cx="505" cy="545" rx="18" ry="15" fill="#e3e83a"/>
+    <ellipse cx="430" cy="660" rx="16" ry="13" fill="#e3e83a"/>
+    <ellipse cx="510" cy="420" rx="14" ry="12" fill="#e3e83a"/>
+    <!-- arm -->
+    <path d="M 632 548 C 668 540, 700 556, 706 582 C 708 594, 694 598, 686 588 C 676 576, 660 572, 640 576 Z" fill="#8bb914"/>
+    <!-- toes -->
+    <g fill="#f6f1df">
+      <circle cx="400" cy="838" r="9"/><circle cx="424" cy="840" r="9"/>
+      <circle cx="540" cy="838" r="9"/><circle cx="564" cy="840" r="9"/>
+    </g>
+    <!-- face -->
+    <ellipse cx="700" cy="300" rx="19" ry="25" fill="#1d2a10"/>
+    <circle cx="707" cy="290" r="7" fill="#fff"/>
+    <ellipse cx="775" cy="282" rx="7" ry="5" fill="#6f8f0c"/>
+    <path d="M 792 388 C 770 405, 735 410, 700 400" fill="none" stroke="#5f7d08" stroke-width="9" stroke-linecap="round"/>
+    <ellipse cx="652" cy="370" rx="26" ry="16" fill="#ff8fa3" fill-opacity="0.85"/>
+    </g>
+  </defs>
+
+  <g filter="url(#drop)">
+    <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#sky)"/>
+  </g>
+  <g clip-path="url(#tile)">
+    <!-- sun -->
+    <circle cx="512" cy="255" r="64" fill="#ffd75e"/>
+    <!-- ground -->
+    <ellipse cx="512" cy="900" rx="520" ry="120" fill="#8fd16a"/>
+    <ellipse cx="512" cy="905" rx="520" ry="110" fill="#7cc35a"/>
+    <!-- the dino and its mirror image, nose to nose -->
+    <g transform="translate(-63 241) scale(0.7)"><use href="#dino"/></g>
+    <g transform="translate(1024 0) scale(-1 1) translate(-63 241) scale(0.7)"><use href="#dino"/></g>
+  </g>
+</svg>

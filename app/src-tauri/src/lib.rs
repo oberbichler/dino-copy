@@ -25,7 +25,7 @@ async fn list_volumes() -> Vec<volumes::Volume> {
 
 /// Why `source` → `target` cannot be started, or `None` if it can.
 #[tauri::command]
-fn check_pair(source: String, target: String) -> Option<String> {
+fn check_pair(source: String, target: String) -> Option<run::Msg> {
     run::check_pair(source.as_ref(), target.as_ref()).err()
 }
 
@@ -37,8 +37,14 @@ fn start(
     mode: Mode,
     source: String,
     target: String,
-) -> Result<(), String> {
+) -> Result<(), run::Msg> {
     run::start(app, &state, mode, source.into(), target.into())
+}
+
+/// The user's preferred languages, most preferred first ("de-AT", "en-US").
+#[tauri::command]
+fn locales() -> Vec<String> {
+    sys_locale::get_locales().collect()
 }
 
 /// Asks the running job to stop. Has no effect once deletions have begun.
@@ -60,7 +66,8 @@ pub fn run() {
             list_volumes,
             check_pair,
             start,
-            cancel
+            cancel,
+            locales
         ])
         .run(tauri::generate_context!())
         .expect("error while running dino-copy");

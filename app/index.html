@@ -17,14 +17,14 @@
     <section id="setup" class="view">
       <div class="route-tiles">
         <button id="pick-source" class="tile" type="button">
-          <span class="tile-caption">Source <span class="chevron" aria-hidden="true"></span></span>
+          <span class="tile-caption"><span data-i18n="source">Source</span> <span class="chevron" aria-hidden="true"></span></span>
           <span class="disk-icon" aria-hidden="true"></span>
           <span class="tile-name"></span>
           <span class="tile-detail"></span>
         </button>
         <span class="route-arrow" aria-hidden="true"></span>
         <button id="pick-target" class="tile" type="button">
-          <span class="tile-caption">Target <span class="chevron" aria-hidden="true"></span></span>
+          <span class="tile-caption"><span data-i18n="target">Target</span> <span class="chevron" aria-hidden="true"></span></span>
           <span class="disk-icon" aria-hidden="true"></span>
           <span class="tile-name"></span>
           <span class="tile-detail"></span>
@@ -35,7 +35,7 @@
         <p id="setup-hint" class="hint"></p>
         <div class="split-button">
           <button id="start" class="primary split-main" type="button" disabled>Mirror</button>
-          <button id="start-menu" class="primary split-arrow" type="button" aria-label="Choose what Start does">
+          <button id="start-menu" class="primary split-arrow" type="button" aria-label="Choose what Start does" data-i18n-aria-label="modeMenu">
             <span class="chevron" aria-hidden="true"></span>
           </button>
         </div>
@@ -44,6 +44,7 @@
 
     <!-- 2 · Running: progress and time left -->
     <section id="running" class="view" hidden>
+      <div class="panel run-panel">
       <p id="run-caption" class="caption"></p>
       <p id="run-eta" class="eta">&nbsp;</p>
       <p id="run-phase" class="phase"></p>
@@ -51,20 +52,21 @@
         <div id="run-bar" class="bar-fill indeterminate"></div>
       </div>
       <div class="stats">
-        <div class="stat"><span class="stat-label">Copied</span><span id="run-bytes" class="stat-value">–</span></div>
-        <div class="stat"><span class="stat-label">Files</span><span id="run-files" class="stat-value">–</span></div>
-        <div class="stat"><span class="stat-label">Speed</span><span id="run-rate" class="stat-value">–</span></div>
+        <div class="stat"><span class="stat-label" data-i18n="copied">Copied</span><span id="run-bytes" class="stat-value">–</span></div>
+        <div class="stat"><span class="stat-label" data-i18n="files">Files</span><span id="run-files" class="stat-value">–</span></div>
+        <div class="stat"><span class="stat-label" data-i18n="speed">Speed</span><span id="run-rate" class="stat-value">–</span></div>
       </div>
       <p id="run-current" class="current"></p>
+      </div>
       <footer class="footer">
         <span class="hint"></span>
-        <button id="cancel" type="button">Cancel</button>
+        <button id="cancel" type="button" data-i18n="cancel">Cancel</button>
       </footer>
     </section>
 
     <!-- 3 · Finished -->
     <section id="done" class="view" hidden>
-      <div class="done-body">
+      <div class="panel done-body">
         <span id="done-icon" class="done-icon" aria-hidden="true"></span>
         <p id="done-headline" class="headline"></p>
         <p id="done-summary" class="secondary"></p>
@@ -72,12 +74,13 @@
       </div>
       <footer class="footer">
         <span class="hint"></span>
-        <button id="done-ok" class="primary" type="button">Done</button>
+        <button id="done-ok" class="primary" type="button" data-i18n="done">Done</button>
       </footer>
     </section>
 
     <!-- 4 · Scan result -->
     <section id="scan" class="view" hidden>
+      <div class="scan-body">
       <header class="scan-head">
         <p id="scan-caption" class="caption"></p>
         <p id="scan-summary" class="headline"></p>
@@ -85,23 +88,24 @@
       </header>
       <div class="toolbar">
         <div class="chips" role="group" aria-label="Show">
-          <button class="chip on" data-cat="copy" type="button"><span class="dot copy"></span>Copy <b id="count-copy">0</b></button>
-          <button class="chip on" data-cat="delete" type="button"><span class="dot delete"></span>Delete <b id="count-delete">0</b></button>
-          <button class="chip on" data-cat="rename" type="button"><span class="dot rename"></span>Rename <b id="count-rename">0</b></button>
+          <button class="chip on" data-cat="copy" type="button"><span class="dot copy"></span><span data-i18n="catCopy">Copy</span> <b id="count-copy">0</b></button>
+          <button class="chip on" data-cat="delete" type="button"><span class="dot delete"></span><span data-i18n="catDelete">Delete</span> <b id="count-delete">0</b></button>
+          <button class="chip on" data-cat="rename" type="button"><span class="dot rename"></span><span data-i18n="catRename">Rename</span> <b id="count-rename">0</b></button>
         </div>
-        <input id="scan-search" class="search" type="search" placeholder="Search" spellcheck="false" autocomplete="off" />
+        <input id="scan-search" class="search" type="search" placeholder="Search" data-i18n-placeholder="search" spellcheck="false" autocomplete="off" />
         <div class="segmented" role="group" aria-label="View">
-          <button id="view-tree" class="on" type="button">Tree</button>
-          <button id="view-list" type="button">List</button>
+          <button id="view-tree" class="on" type="button" data-i18n="tree">Tree</button>
+          <button id="view-list" type="button" data-i18n="list">List</button>
         </div>
       </div>
       <div id="scan-rows" class="rows" tabindex="0">
         <div id="scan-spacer" class="rows-spacer"></div>
       </div>
+      </div>
       <footer class="footer">
         <span id="scan-shown" class="hint"></span>
-        <button id="scan-close" type="button">Close</button>
-        <button id="scan-mirror" class="primary" type="button">Mirror Now</button>
+        <button id="scan-close" type="button" data-i18n="close">Close</button>
+        <button id="scan-mirror" class="primary" type="button" data-i18n="mirrorNow">Mirror Now</button>
       </footer>
     </section>
   </body>
