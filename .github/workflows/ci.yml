@@ -24,7 +24,7 @@ jobs:
         toolchain: [stable, "1.85"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain }}
@@ -35,7 +35,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -52,8 +52,8 @@ jobs:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -66,9 +66,17 @@ jobs:
           workspaces: app/src-tauri
       - run: npm ci
       - run: npm run typecheck
-      # Builds the frontend into dist/, which the Rust build embeds.
+      # Builds the frontend into dist/, which the Rust build embeds and the UI
+      # tests serve.
       - run: npm run build
       - run: cargo clippy --locked --all-targets -- -D warnings
         working-directory: app/src-tauri
       - run: cargo test --locked
         working-directory: app/src-tauri
+      - run: npx playwright install webkit
+      - run: npx playwright test
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: ui-test-report
+          path: app/playwright-report
