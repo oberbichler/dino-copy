@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "dino-copy"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "dino-copy-core"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
