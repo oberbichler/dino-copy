@@ -334,30 +334,15 @@ jobs:
           done
           git push
 
-  custom-publish-app:
-    needs:
-      - plan
-      - host
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
-    uses: ./.github/workflows/publish-app.yml
-    with:
-      plan: ${{ needs.plan.outputs.val }}
-    secrets: inherit
-    # publish jobs get escalated permissions
-    permissions:
-      "id-token": "write"
-      "packages": "write"
-
   announce:
     needs:
       - plan
       - host
       - publish-homebrew-formula
-      - custom-publish-app
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') && (needs.custom-publish-app.result == 'skipped' || needs.custom-publish-app.result == 'success') }}
+    if: ${{ always() && needs.host.result == 'success' && (needs.publish-homebrew-formula.result == 'skipped' || needs.publish-homebrew-formula.result == 'success') }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -366,3 +351,12 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  custom-publish-app:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/publish-app.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
