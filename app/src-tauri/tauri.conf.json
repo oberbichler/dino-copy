@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DinoCopy",
-  "version": "0.2.1",
   "identifier": "com.oberbichler.dino-copy",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -45,7 +44,8 @@
     "category": "public.app-category.utilities",
     "shortDescription": "Mirror one disk onto another",
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
     }
   }
 }

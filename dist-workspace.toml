@@ -11,8 +11,12 @@ ci = "github"
 installers = ["shell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "oberbichler/homebrew-tap"
-# Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+# Publish jobs to run in CI. dist only knows the command line tool; the
+# desktop app (app/, its own workspace) is built and published by our own
+# reusable workflows: the disk image goes into the same GitHub release, and
+# the cask into the same tap.
+publish-jobs = ["homebrew", "./publish-app"]
+global-artifacts-jobs = ["./build-app"]
 # Target platforms to build apps for (Rust target-triple syntax). dino-copy is
 # Unix-only (main.rs refuses to compile elsewhere), so macOS and Linux, no Windows.
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]

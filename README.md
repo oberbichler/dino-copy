@@ -9,9 +9,13 @@ It is built for backups between external disks (USB HDDs and SSDs), where two
 things matter most: **the backup is complete**, and **nothing is deleted that
 should not be**.
 
+dino-copy comes as a command line tool for macOS and Linux, and as
+**DinoCopy**, a desktop app for macOS (see [Desktop app](#desktop-app)). Both
+use the same engine and are released together.
+
 ## Installation
 
-Homebrew (macOS, Linux):
+Command line tool, with Homebrew (macOS, Linux):
 
 ```sh
 brew install oberbichler/tap/dino-copy
@@ -25,7 +29,17 @@ source (Rust 1.85 or newer):
 cargo install --git https://github.com/oberbichler/dino-copy
 ```
 
-dino-copy runs on macOS and Linux.
+Desktop app (macOS 11 or newer, Apple Silicon and Intel):
+
+```sh
+brew install --cask oberbichler/tap/dinocopy
+```
+
+or download `DinoCopy.dmg` from the
+[latest release](https://github.com/oberbichler/dino-copy/releases/latest).
+The app is not notarized by Apple, so macOS refuses the first start of a
+downloaded copy: open it once, then choose **Open Anyway** in System Settings
+→ Privacy & Security. (Homebrew installs it without that step.)
 
 ## Usage
 
@@ -156,44 +170,76 @@ checksum run 0.72 s, while the 300,000 tiny files get slower (53 s): parallel
 creation in one directory contends. On USB hard disks the disk dominates the
 copy times, and the differences shrink; the faster scan remains.
 
-## Desktop app (preview)
+## Desktop app
 
-`app/` holds DinoCopy, a macOS app for the same job: pick the source and target disks
-from a list, press **Mirror**, and watch the progress and the time left. The
-arrow next to the button switches to **Scan**, which shows every change a
-mirror would make as a tree or a list, with filters and a search, without
-changing anything. The app uses the same engine and the same safety rules as
-the command line tool, and it leaves out the folders macOS keeps on every
-volume (`.Spotlight-V100`, `.fseventsd`, `.Trashes`, …).
+DinoCopy does the same job in a window: pick the source and target disks
+from a list (or any folder), press **Mirror**, and watch the progress and the
+time left. The arrow next to the button switches to **Scan**, which shows
+every change a mirror would make as a tree or a list, with filters and a
+search, without changing anything. The app uses the same engine and the same
+safety rules as the command line tool, and it leaves out the folders macOS
+keeps on every volume (`.Spotlight-V100`, `.fseventsd`, `.Trashes`, …). It
+keeps the Mac awake during a run and notifies when it is done.
+
+When something cannot be mirrored, the result says what happened and what to
+do, grouped by cause (the target is full, a file is too large for the target's
+format, no access, …); the full error lines are under **Details**. A
+remembered disk that is not connected says so.
 
 The window follows the system language: English, German, French, Spanish,
-Italian, Dutch, Polish and Portuguese. Translations live in `app/src/i18n/`;
-English defines the keys, and the type check fails if a language misses one.
-The icon is drawn in `app/icon/icon.svg`.
-
-It is not released yet. To run it from source (Node.js and Rust required):
-
-```sh
-cd app
-npm install
-npm run tauri dev
-```
+Italian, Dutch, Polish and Portuguese.
 
 ## Development
+
+| Path | What |
+| --- | --- |
+| `core/` | `dino-copy-core`, the engine: walk, plan, copy, delete. |
+| `src/`, `tests/` | The command line tool and its integration tests. |
+| `app/` | DinoCopy: the window (`index.html`, `src/`, TypeScript with Vite) and the Tauri backend (`src-tauri/`, its own Cargo workspace and lockfile). |
+| `app/src/i18n/` | Translations. English defines the keys; the type check fails if a language misses one. |
+| `app/tests/` | UI tests of the window in every state, language and colour scheme. |
+| `app/icon/` | The icon's source (`icon.svg`, rendered by `render.mjs`). |
+| `app/packaging/` | The Homebrew cask, filled in by the release. |
+
+Command line tool and engine (Rust 1.85 or newer):
 
 ```sh
 cargo test --workspace   # unit, integration and property-based tests
 cargo clippy --workspace --all-targets
 ```
 
-The engine lives in `core/` (`dino-copy-core`), shared by the command line
-tool (`src/`) and the desktop app (`app/`, its own Cargo workspace).
+The app (Node.js 22 and Rust 1.88 or newer):
 
-The core guarantees are checked by property-based tests (`src/walk_props.rs`):
+```sh
+cd app
+npm install
+npm run tauri dev        # the app, reloading on changes
+npm run typecheck
+npm run test:ui          # UI tests in WebKit (once: npx playwright install webkit)
+cd src-tauri && cargo test
+```
+
+The UI tests replace the backend with a stand-in (`app/tests/tauri.ts`) and
+check each state's behaviour and that no text is cut off. With
+`SCREENSHOTS=<dir>` they also save a screenshot of every state.
+
+The core guarantees are checked by property-based tests (`core/src/walk_props.rs`):
 random source and target trees are mirrored and compared against an
 independent model, and the source is swapped for an arbitrary other tree
 between the two passes to check that nothing unplanned is ever deleted. Raise
 `PROPTEST_CASES` for a deeper search.
+
+### Releasing
+
+The command line tool and the app share one version (`Cargo.toml`,
+`core/Cargo.toml`, `app/src-tauri/Cargo.toml`, `app/package.json`; a test
+checks that they match). Pushing a tag `vX.Y.Z` runs `release.yml`:
+[dist](https://github.com/axodotdev/cargo-dist) builds the command line tool
+and updates its formula in
+[oberbichler/homebrew-tap](https://github.com/oberbichler/homebrew-tap);
+`build-app.yml` builds `DinoCopy.dmg` (universal, signed ad hoc) for the same
+GitHub release, and `publish-app.yml` updates the `dinocopy` cask. `release.yml`
+is generated: change `dist-workspace.toml` and run `dist generate`.
 
 ## License
 
