@@ -1,0 +1,21 @@
+[package]
+name = "dino-copy-core"
+version = "0.2.1"
+edition = "2024"
+description = "The mirror engine behind dino-copy: streaming two-pass walk, copy and safety rules"
+license = "ISC"
+repository = "https://github.com/oberbichler/dino-copy"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+filetime = "0.2"
+globset = "0.4"
+rayon = "1"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"

@@ -1,7 +1,7 @@
 //! Terminal progress display (indicatif): a counter while scanning, and
 //! bytes, files and one status line per copy worker while mirroring.
 
-use crate::sync::ProgressSink;
+use dino_copy_core::sync::ProgressSink;
 use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -121,7 +121,7 @@ impl ScanProgressBars {
     }
 }
 
-impl crate::walk::ScanProgress for ScanProgressBars {
+impl dino_copy_core::walk::ScanProgress for ScanProgressBars {
     fn listed(&self, n: u64) {
         self.entries.inc(n);
     }

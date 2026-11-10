@@ -281,12 +281,22 @@ name = "dino-copy"
 version = "0.2.1"
 dependencies = [
  "anyhow",
- "blake3",
  "clap",
  "ctrlc",
+ "dino-copy-core",
+ "filetime",
+ "indicatif",
+ "tempfile",
+]
+
+[[package]]
+name = "dino-copy-core"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "blake3",
  "filetime",
  "globset",
- "indicatif",
  "proptest",
  "rayon",
  "tempfile",

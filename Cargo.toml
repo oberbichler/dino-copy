@@ -1,3 +1,10 @@
+# The command line tool lives in the root package; the mirror engine is the
+# `core` library. The desktop app (`app/`) is deliberately its own workspace
+# with its own lockfile, so its dependencies never touch the CLI's.
+[workspace]
+members = [".", "core"]
+exclude = ["app"]
+
 [package]
 name = "dino-copy"
 version = "0.2.1"
@@ -14,20 +21,16 @@ categories = ["command-line-utilities", "filesystem"]
 rust-version = "1.85"
 
 [dependencies]
+dino-copy-core = { path = "core" }
 clap = { version = "4", features = ["derive"] }
-globset = "0.4"
 indicatif = "0.18"
-filetime = "0.2"
-blake3 = "1"
 anyhow = "1"
 # termination: additionally catches SIGTERM and SIGHUP. Without the feature,
 # temp files are left behind in the target on a cron timeout or at logout.
 ctrlc = { version = "3", features = ["termination"] }
-rayon = "1"
-unicode-normalization = "0.1"
 
 [dev-dependencies]
-proptest = "1"
+filetime = "0.2"
 tempfile = "3"
 
 [[bin]]
