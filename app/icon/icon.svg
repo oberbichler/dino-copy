@@ -3,8 +3,8 @@
        (render with render.mjs, then `npx tauri icon icon.png`). -->
   <defs>
     <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#d9f1ff"/>
-      <stop offset="1" stop-color="#a6d8f5"/>
+      <stop offset="0" stop-color="#a8dcff"/>
+      <stop offset="1" stop-color="#3f9fe6"/>
     </linearGradient>
     <filter id="drop" x="-10%" y="-10%" width="120%" height="125%">
       <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.22"/>
@@ -39,23 +39,23 @@
       C 515 265, 535 255, 560 250 Z"/>
     <g id="dino">
     <!-- shadow -->
-    <ellipse cx="500" cy="846" rx="190" ry="18" fill="#000" fill-opacity="0.12"/>
+    <ellipse cx="500" cy="846" rx="190" ry="18" fill="#000" fill-opacity="0.22"/>
 
     <!-- the original -->
-    <use href="#silhouette" fill="#9fcb1f"/>
+    <use href="#silhouette" fill="#8cc21a" stroke="#3f5c06" stroke-width="10" stroke-linejoin="round"/>
     <!-- belly -->
-    <path d="M 625 452 C 640 520, 655 590, 645 660 C 640 712, 625 750, 600 772 C 600 700, 590 600, 560 520 C 575 490, 600 465, 625 452 Z" fill="#c7e05a"/>
+    <path d="M 625 452 C 640 520, 655 590, 645 660 C 640 712, 625 750, 600 772 C 600 700, 590 600, 560 520 C 575 490, 600 465, 625 452 Z" fill="#d8ef72"/>
     <!-- far leg shading -->
     <path d="M 470 792 C 490 793, 505 793, 526 790 L 524 812 C 522 830, 532 842, 550 842 L 582 842 C 600 842, 613 832, 612 812 L 610 770 C 585 785, 520 795, 470 792 Z" fill="#000" fill-opacity="0.08"/>
     <!-- thigh -->
-    <path d="M 380 690 C 400 620, 500 610, 530 680 C 550 730, 520 780, 470 790 C 420 792, 370 750, 380 690 Z" fill="#8bb914"/>
+    <path d="M 380 690 C 400 620, 500 610, 530 680 C 550 730, 520 780, 470 790 C 420 792, 370 750, 380 690 Z" fill="#6f9e0c"/>
     <!-- spots -->
-    <ellipse cx="455" cy="590" rx="30" ry="24" fill="#e3e83a"/>
-    <ellipse cx="505" cy="545" rx="18" ry="15" fill="#e3e83a"/>
-    <ellipse cx="430" cy="660" rx="16" ry="13" fill="#e3e83a"/>
-    <ellipse cx="510" cy="420" rx="14" ry="12" fill="#e3e83a"/>
+    <ellipse cx="455" cy="590" rx="30" ry="24" fill="#f2f03a"/>
+    <ellipse cx="505" cy="545" rx="18" ry="15" fill="#f2f03a"/>
+    <ellipse cx="430" cy="660" rx="16" ry="13" fill="#f2f03a"/>
+    <ellipse cx="510" cy="420" rx="14" ry="12" fill="#f2f03a"/>
     <!-- arm -->
-    <path d="M 632 548 C 668 540, 700 556, 706 582 C 708 594, 694 598, 686 588 C 676 576, 660 572, 640 576 Z" fill="#8bb914"/>
+    <path d="M 632 548 C 668 540, 700 556, 706 582 C 708 594, 694 598, 686 588 C 676 576, 660 572, 640 576 Z" fill="#6f9e0c"/>
     <!-- toes -->
     <g fill="#f6f1df">
       <circle cx="400" cy="838" r="9"/><circle cx="424" cy="840" r="9"/>
@@ -64,8 +64,8 @@
     <!-- face -->
     <ellipse cx="700" cy="300" rx="19" ry="25" fill="#1d2a10"/>
     <circle cx="707" cy="290" r="7" fill="#fff"/>
-    <ellipse cx="775" cy="282" rx="7" ry="5" fill="#6f8f0c"/>
-    <path d="M 792 388 C 770 405, 735 410, 700 400" fill="none" stroke="#5f7d08" stroke-width="9" stroke-linecap="round"/>
+    <ellipse cx="775" cy="282" rx="7" ry="5" fill="#3f5c06"/>
+    <path d="M 792 388 C 770 405, 735 410, 700 400" fill="none" stroke="#3f5c06" stroke-width="9" stroke-linecap="round"/>
     <ellipse cx="652" cy="370" rx="26" ry="16" fill="#ff8fa3" fill-opacity="0.85"/>
     </g>
   </defs>
@@ -75,10 +75,10 @@
   </g>
   <g clip-path="url(#tile)">
     <!-- sun -->
-    <circle cx="512" cy="255" r="64" fill="#ffd75e"/>
+    <circle cx="512" cy="255" r="64" fill="#ffcc2e"/>
     <!-- ground -->
-    <ellipse cx="512" cy="900" rx="520" ry="120" fill="#8fd16a"/>
-    <ellipse cx="512" cy="905" rx="520" ry="110" fill="#7cc35a"/>
+    <ellipse cx="512" cy="900" rx="520" ry="120" fill="#5cb847"/>
+    <ellipse cx="512" cy="905" rx="520" ry="110" fill="#46a138"/>
     <!-- the dino and its mirror image, nose to nose -->
     <g transform="translate(-63 241) scale(0.7)"><use href="#dino"/></g>
     <g transform="translate(1024 0) scale(-1 1) translate(-63 241) scale(0.7)"><use href="#dino"/></g>
