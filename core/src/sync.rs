@@ -2,6 +2,7 @@
 //! file + rename), symlinks, directory metadata, fsync — plus the temp-file
 //! registry that the Ctrl-C handler cleans up.
 
+use crate::problem::Problem;
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -354,12 +355,12 @@ fn copy_chunked(
 /// read-only target makes millions of actions fail.
 const MAX_STORED_ERRORS: usize = 100;
 
-pub fn record_error(errors: &std::sync::Mutex<Vec<String>>, msg: String) {
+pub fn record_error(errors: &std::sync::Mutex<Vec<Problem>>, problem: Problem) {
     let mut list = errors.lock().unwrap();
     if list.len() < MAX_STORED_ERRORS {
-        list.push(msg);
+        list.push(problem);
     } else if list.len() == MAX_STORED_ERRORS {
-        list.push("... further errors suppressed".to_string());
+        list.push(Problem::suppressed());
     }
 }
 

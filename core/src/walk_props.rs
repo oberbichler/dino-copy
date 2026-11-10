@@ -467,7 +467,11 @@ impl Setup {
         walk::plan(&self.roots(), opts, None)
     }
 
-    fn execute(&self, plan: &Plan, jobs: usize) -> (walk::ExecReport, Vec<String>) {
+    fn execute(
+        &self,
+        plan: &Plan,
+        jobs: usize,
+    ) -> (walk::ExecReport, Vec<crate::problem::Problem>) {
         let errors = Mutex::new(Vec::new());
         let opts = ExecOptions {
             jobs,

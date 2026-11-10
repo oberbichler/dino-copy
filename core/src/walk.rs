@@ -41,6 +41,7 @@
 
 use crate::filter::Filter;
 use crate::plan::{Child, EntryKind, FileEntry, FileId, Listing, Op, Stats, diff_dir, hash_file};
+use crate::problem::{Action, Problem};
 use crate::sync::{self, ProgressSink};
 use rayon::prelude::*;
 use std::collections::BTreeSet;
@@ -87,7 +88,7 @@ pub trait PlanObserver: Sync {
     fn hashed(&self);
     /// Something the user should know but that does not stop the run, e.g.
     /// an unreadable directory or a skipped special file.
-    fn warning(&self, msg: &str);
+    fn warning(&self, problem: &Problem);
 }
 
 /// Reads one directory: its entries (filtered, sorted by name) or the error
@@ -102,11 +103,11 @@ pub fn read_listing(
     rel: &Path,
     filter: &Filter,
     observer: Option<&dyn PlanObserver>,
-) -> Result<Listing, String> {
-    let rd = std::fs::read_dir(abs).map_err(|e| e.to_string())?;
+) -> std::io::Result<Listing> {
+    let rd = std::fs::read_dir(abs)?;
     let mut names: Vec<OsString> = Vec::new();
     for entry in rd {
-        let name = entry.map_err(|e| e.to_string())?.file_name();
+        let name = entry?.file_name();
         // Apply exclusions before the lstat: an excluded directory is neither
         // listed nor entered, so it drops out together with its subtree.
         if !filter.is_empty() && filter.excludes(&rel.join(&name)) {
@@ -114,7 +115,7 @@ pub fn read_listing(
         }
         names.push(name);
     }
-    let read: Vec<Result<Option<(OsString, FileEntry)>, String>> = names
+    let read: Vec<std::io::Result<Option<(OsString, FileEntry)>>> = names
         .into_par_iter()
         .map(|name| read_entry(abs, name, observer))
         .collect();
@@ -128,22 +129,25 @@ pub fn read_listing(
     Ok(out)
 }
 
+/// An error reading one entry, with its path in the message (the listing
+/// error names only the directory).
+fn in_entry(path: &Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
 /// `lstat` + `read_link` for one entry. `Ok(None)` for entries that do not take
 /// part in the mirror (special files, vanished entries).
 fn read_entry(
     dir: &Path,
     name: OsString,
     observer: Option<&dyn PlanObserver>,
-) -> Result<Option<(OsString, FileEntry)>, String> {
+) -> std::io::Result<Option<(OsString, FileEntry)>> {
     use std::os::unix::fs::MetadataExt;
 
     let path = dir.join(&name);
-    let vanished = |what: &str| {
+    let vanished = |what: &'static str| {
         if let Some(o) = observer {
-            o.warning(&format!(
-                "skipping {what} (vanished during the scan): {}",
-                path.display()
-            ));
+            o.warning(&Problem::note(Action::Vanished { what }, &path, ""));
         }
     };
     // symlink_metadata does NOT follow the link: symlinks are mirrored as
@@ -154,7 +158,7 @@ fn read_entry(
             vanished("entry");
             return Ok(None);
         }
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Err(e) => return Err(in_entry(&path, e)),
     };
     let kind = if meta.file_type().is_symlink() {
         match std::fs::read_link(&path) {
@@ -163,7 +167,7 @@ fn read_entry(
                 vanished("symlink");
                 return Ok(None);
             }
-            Err(e) => return Err(format!("{}: {e}", path.display())),
+            Err(e) => return Err(in_entry(&path, e)),
         }
     } else if meta.is_dir() {
         EntryKind::Dir
@@ -172,7 +176,7 @@ fn read_entry(
     } else {
         // File::open on a FIFO blocks until a writer connects -> deadlock.
         if let Some(o) = observer {
-            o.warning(&format!("skipping special file {}", path.display()));
+            o.warning(&Problem::note(Action::SpecialFile, &path, ""));
         }
         return Ok(None);
     };
@@ -247,7 +251,7 @@ impl Drop for DirNode<'_> {
         let target = exec.dst_root.join(&self.rel);
         if exec.fsync && *self.touched.get_mut() {
             if let Err(e) = sync::sync_dir(&target) {
-                exec.fail(format!("fsync dir {}: {e}", target.display()));
+                exec.fail(Problem::io(Action::FsyncDir, &target, &e));
             }
         }
         if !self.needs_meta() {
@@ -261,10 +265,7 @@ impl Drop for DirNode<'_> {
                 .push((std::mem::take(&mut self.rel), mtime, mode));
         } else if let Err(e) = sync::set_dir_meta(&target, mtime, mode) {
             exec.meta_failed.fetch_add(1, Ordering::Relaxed);
-            sync::record_error(
-                exec.errors,
-                format!("set dir meta {}: {e}", target.display()),
-            );
+            sync::record_error(exec.errors, Problem::io(Action::SetDirMeta, &target, &e));
         }
     }
 }
@@ -357,10 +358,10 @@ impl Walker<'_> {
         }
     }
 
-    fn report_unreadable(&self, abs: &Path, err: &str) {
+    fn report_unreadable(&self, abs: &Path, err: &std::io::Error) {
         self.unreadable.fetch_add(1, Ordering::Relaxed);
         if let Some(o) = self.observer {
-            o.warning(&format!("contents not readable: {} ({err})", abs.display()));
+            o.warning(&Problem::io(Action::Unreadable, abs, err));
         }
     }
 
@@ -372,7 +373,7 @@ impl Walker<'_> {
         let rd = match std::fs::read_dir(&abs) {
             Ok(rd) => rd,
             Err(e) => {
-                self.report_unreadable(&abs, &e.to_string());
+                self.report_unreadable(&abs, &e);
                 return 1;
             }
         };
@@ -381,7 +382,7 @@ impl Walker<'_> {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    self.report_unreadable(&abs, &e.to_string());
+                    self.report_unreadable(&abs, &e);
                     break;
                 }
             };
@@ -763,7 +764,7 @@ impl<'a> Visitor<'a> for Planner {
     fn collision(&self, w: &Walker<'_>, rel: &Path, why: &str) {
         self.collisions.fetch_add(1, Ordering::Relaxed);
         if let Some(o) = w.observer {
-            o.warning(&format!("cannot mirror {}: {why}", rel.display()));
+            o.warning(&Problem::note(Action::Collision, rel, why));
         }
     }
 }
@@ -894,7 +895,7 @@ impl ProgressSink for CancelAware<'_> {
 struct ExecShared<'a> {
     dst_root: &'a Path,
     fsync: bool,
-    errors: &'a Mutex<Vec<String>>,
+    errors: &'a Mutex<Vec<Problem>>,
     /// Failures before the delete phase. They block the deletions.
     failed: AtomicU64,
     /// Failures while applying directory metadata. They make the run fail but
@@ -908,9 +909,9 @@ struct ExecShared<'a> {
 }
 
 impl ExecShared<'_> {
-    fn fail(&self, msg: String) {
+    fn fail(&self, problem: Problem) {
         self.failed.fetch_add(1, Ordering::Relaxed);
-        sync::record_error(self.errors, msg);
+        sync::record_error(self.errors, problem);
     }
 }
 
@@ -954,10 +955,10 @@ impl<'a> Visitor<'a> for Executor<'a> {
         let dir = w.roots.dst.join(&node.rel);
         for r in renames {
             if let Err(e) = std::fs::rename(dir.join(&r.from), dir.join(&r.to)) {
-                shared.fail(format!(
-                    "rename {} to {:?}: {e}",
-                    dir.join(&r.from).display(),
-                    r.to
+                shared.fail(Problem::io(
+                    Action::Rename { to: r.to.clone() },
+                    dir.join(&r.from),
+                    &e,
                 ));
             }
         }
@@ -975,14 +976,11 @@ impl<'a> Visitor<'a> for Executor<'a> {
                 // subtree), so it is held to the same rule as the removals:
                 // only what pass 1 planned and the user confirmed.
                 if !self.plan.conflicts.contains(&rel) {
-                    shared.fail(format!(
-                        "type of {} changed since the plan; left untouched",
-                        rel.display()
-                    ));
+                    shared.fail(Problem::note(Action::TypeChanged, &rel, ""));
                     continue;
                 }
                 if let Err(e) = sync::remove_any(&target) {
-                    shared.fail(format!("remove conflict {}: {e}", target.display()));
+                    shared.fail(Problem::io(Action::RemoveConflict, &target, &e));
                     continue;
                 }
             }
@@ -996,7 +994,7 @@ impl<'a> Visitor<'a> for Executor<'a> {
                     if let Err(e) =
                         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
                     {
-                        shared.fail(format!("set file meta {}: {e}", target.display()));
+                        shared.fail(Problem::io(Action::SetFileMeta, &target, &e));
                     }
                 }
                 Op::Same { mode: None, .. } | Op::Keep => {}
@@ -1005,7 +1003,7 @@ impl<'a> Visitor<'a> for Executor<'a> {
                     mtime,
                 } => match sync::create_symlink(&link, &target, mtime) {
                     Ok(()) => self.sink.inc_files(),
-                    Err(e) => shared.fail(format!("symlink {}: {e}", target.display())),
+                    Err(e) => shared.fail(Problem::io(Action::Symlink, &target, &e)),
                 },
                 Op::Dir {
                     mtime,
@@ -1015,7 +1013,7 @@ impl<'a> Visitor<'a> for Executor<'a> {
                 } => {
                     if create {
                         if let Err(e) = std::fs::create_dir_all(&target) {
-                            shared.fail(format!("mkdir {}: {e}", target.display()));
+                            shared.fail(Problem::io(Action::Mkdir, &target, &e));
                         }
                     }
                     subdirs.push(SubDir {
@@ -1035,8 +1033,7 @@ impl<'a> Visitor<'a> for Executor<'a> {
     }
 
     fn collision(&self, _: &Walker<'_>, rel: &Path, why: &str) {
-        self.shared
-            .fail(format!("cannot mirror {}: {why}", rel.display()));
+        self.shared.fail(Problem::note(Action::Collision, rel, why));
     }
 }
 
@@ -1070,7 +1067,7 @@ pub fn execute(
     plan: &Plan,
     opts: ExecOptions,
     sink: &dyn ProgressSink,
-    errors: &Mutex<Vec<String>>,
+    errors: &Mutex<Vec<Problem>>,
 ) -> ExecReport {
     let sink = &CancelAware {
         inner: sink,
@@ -1113,7 +1110,7 @@ pub fn execute(
                     if let Err(e) = sync::copy_file(&src, &dst, sink, opts.fsync) {
                         // A copy interrupted by the cancel is not a failure.
                         if !sink.cancelled() {
-                            shared.fail(format!("copy {}: {e}", job.rel.display()));
+                            shared.fail(Problem::chain(Action::Copy, &job.rel, &e));
                         }
                     }
                     // Dropping the job may complete its directory (metadata).
@@ -1179,7 +1176,7 @@ pub fn execute(
                     std::fs::remove_file(&target)
                 };
                 if let Err(e) = res {
-                    shared.fail(format!("rm {}: {e}", target.display()));
+                    shared.fail(Problem::io(Action::Remove, &target, &e));
                 }
             }
         }
@@ -1193,7 +1190,7 @@ pub fn execute(
         let target = roots.dst.join(&rel);
         if let Err(e) = sync::set_dir_meta(&target, mtime, mode) {
             shared.meta_failed.fetch_add(1, Ordering::Relaxed);
-            sync::record_error(errors, format!("set dir meta {}: {e}", target.display()));
+            sync::record_error(errors, Problem::io(Action::SetDirMeta, &target, &e));
         }
     }
 
@@ -1240,7 +1237,7 @@ mod tests {
         plan: &Plan,
         opts: ExecOptions,
         sink: &dyn ProgressSink,
-    ) -> (ExecReport, Vec<String>) {
+    ) -> (ExecReport, Vec<Problem>) {
         let f = Filter::default();
         let errors = Mutex::new(Vec::new());
         let opts = ExecOptions {
@@ -1257,7 +1254,7 @@ mod tests {
         d: &Path,
         opts: ExecOptions,
         sink: &dyn ProgressSink,
-    ) -> (ExecReport, Vec<String>) {
+    ) -> (ExecReport, Vec<Problem>) {
         exec_plan(s, d, &plan_of(s, d), opts, sink)
     }
 
@@ -1493,7 +1490,7 @@ mod tests {
 
         assert_eq!(fs::read(d.join("photos/1.jpg")).unwrap(), b"jpeg");
         assert_eq!(r.failed, 1, "the skipped conflict must fail the run");
-        assert!(errs[0].contains("changed since the plan"), "{errs:?}");
+        assert_eq!(errs[0].action, Action::TypeChanged, "{errs:?}");
     }
 
     #[test]

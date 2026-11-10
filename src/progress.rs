@@ -130,8 +130,8 @@ impl dino_copy_core::walk::PlanObserver for ScanProgressBars {
             bar.inc(1);
         }
     }
-    fn warning(&self, msg: &str) {
-        eprintln!("Warning: {msg}");
+    fn warning(&self, problem: &dino_copy_core::problem::Problem) {
+        eprintln!("Warning: {problem}");
     }
 }
 

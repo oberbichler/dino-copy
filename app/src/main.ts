@@ -29,9 +29,11 @@ interface Choice {
   path: string;
   name: string;
   kind: "volume" | "folder";
-  /** Free and total bytes, as seen when the disk was picked. */
+  /** Free and total bytes, as last seen. */
   free?: number;
   total?: number;
+  /** A remembered disk that is not connected right now. */
+  offline?: boolean;
 }
 
 /** "120 GB free of 2 TB" for a disk (in the current language). */
@@ -82,11 +84,33 @@ type Msg =
   | { key: "rootMetaFailed"; error: string }
   | { key: "detail"; text: string };
 
+/** A group of problems, in the order of importance (see run.rs). */
+type IssueKind =
+  | "targetFull"
+  | "readOnly"
+  | "noPermission"
+  | "tooLarge"
+  | "badName"
+  | "nameClash"
+  | "unreadable"
+  | "changed"
+  | "other";
+
+interface Issue {
+  kind: IssueKind;
+  count: number;
+}
+
 interface RunResult {
   mode: Mode;
   outcome: "success" | "inSync" | "scanned" | "incomplete" | "failed" | "cancelled";
   headline: Msg;
+  /** What went wrong, grouped. */
+  issues: Issue[];
+  /** Further notes (deletions skipped, ...). */
   messages: Msg[];
+  /** Every problem as a technical line. */
+  details: string[];
   summary: Summary;
   durationSecs: number;
   items?: ScanItem[];
@@ -148,8 +172,10 @@ function renderPicker(side: Side): void {
   detail.classList.toggle("path", choice?.kind === "folder");
   if (choice?.kind === "folder") setPath(detail, choice.path);
   else detail.textContent = choice ? volumeDetail(choice) : t("diskOrFolder");
+  if (choice?.offline) detail.textContent = t("offline");
   el.querySelector(".disk-icon")!.className = `disk-icon ${choice?.kind ?? "none"}`;
   el.classList.toggle("empty", !choice);
+  el.classList.toggle("offline", choice?.offline === true);
 }
 
 async function openPicker(side: Side): Promise<void> {
@@ -259,6 +285,8 @@ async function start(mode: Mode): Promise<void> {
   onPhase("scanning");
   for (const id of ["run-bytes", "run-rate", "run-files"]) $(id).textContent = "–";
   $("run-current").textContent = "";
+  $("run-current").hidden = false;
+  $("run-issues").hidden = true;
   try {
     await invoke("start", { mode, source: state.source.path, target: state.target.path });
   } catch (e) {
@@ -318,14 +346,62 @@ function onProgress(p: Progress): void {
   setPath($("run-current"), p.current);
 }
 
+/** Problems as they happen: a full target should not wait for the end. */
+function onIssues(kinds: IssueKind[]): void {
+  const el = $("run-issues");
+  el.hidden = kinds.length === 0;
+  el.textContent = kinds.map((k) => issueTitle(k)).join(" · ");
+  // The room of the current file name, which matters less now.
+  $("run-current").hidden = kinds.length > 0;
+}
+
 // ---------------------------------------------------------------------------
 // 3 · Done, 4 · Scan
 // ---------------------------------------------------------------------------
 
+const ISSUE_KEY = {
+  targetFull: "TargetFull",
+  readOnly: "ReadOnly",
+  noPermission: "NoPermission",
+  tooLarge: "TooLarge",
+  badName: "BadName",
+  nameClash: "NameClash",
+  unreadable: "Unreadable",
+  changed: "Changed",
+  other: "Other",
+} as const satisfies Record<IssueKind, string>;
+
+function issueTitle(kind: IssueKind): string {
+  return t(`issue${ISSUE_KEY[kind]}`);
+}
+
+function issueText(issue: Issue): string {
+  return t(`issue${ISSUE_KEY[issue.kind]}Text`, { n: issue.count });
+}
+
+/** Title and one sentence for the result, short and in plain words. */
+function doneText(r: RunResult): { title: string; text: string } {
+  const h = r.headline;
+  switch (r.outcome) {
+    case "success":
+      return { title: msgText(h), text: summaryText(r) };
+    case "inSync":
+      return { title: t("inSyncTitle"), text: summaryText(r) };
+    case "incomplete":
+      return { title: t("notAllMirrored"), text: summaryText(r) };
+    case "cancelled":
+      return { title: t("cancelledTitle"), text: msgText(h) };
+    default:
+      return h.key === "sourceEmpty"
+        ? { title: t("sourceEmptyTitle"), text: msgText(h) }
+        : { title: t("failedTitle"), text: msgText(h) };
+  }
+}
+
 async function onDone(r: RunResult): Promise<void> {
   state.running = false;
   state.lastResult = r;
-  if (r.mode === "mirror") void notify(msgText(r.headline));
+  if (r.mode === "mirror") void notify(doneText(r).title);
   if (state.closeWhenDone) {
     await win.destroy();
     return;
@@ -334,17 +410,57 @@ async function onDone(r: RunResult): Promise<void> {
     await showScan(r);
     return;
   }
+  const { title, text } = doneText(r);
+  const problems = r.issues.length + r.messages.length > 0;
   $("done-icon").className = `done-icon ${r.outcome}`;
-  $("done-headline").textContent = msgText(r.headline);
-  $("done-summary").textContent = summaryText(r);
-  $("done-messages").innerHTML = "";
-  for (const m of r.messages) {
-    const li = document.createElement("li");
-    li.textContent = msgText(m);
-    $("done-messages").append(li);
-  }
+  $("done-headline").textContent = title;
+  $("done-summary").textContent = text;
+  $("done-body").classList.toggle("has-issues", problems);
+  renderIssues($("done-issues"), r.issues, r.messages);
+
+  // Details: the technical lines, to look up or to pass on.
+  $("done-details").textContent = r.details.join("\n");
+  showDetails(false);
+  $("details-toggle").hidden = r.details.length === 0;
+
+  // The next step, where there is one: try again, or carry on.
+  const retry = $("done-retry");
+  retry.hidden = !(r.outcome === "incomplete" || r.outcome === "cancelled" || (r.outcome === "failed" && r.headline.key !== "sourceEmpty"));
+  retry.textContent = t(r.outcome === "cancelled" ? "resume" : "retry");
+
   show("done");
-  if (r.messages.length > 0) await setWindow("tall");
+  // One problem fits the small window; more need room to be read.
+  await setWindow(r.issues.length + r.messages.length > 1 ? "tall" : "small");
+}
+
+/** The technical lines take the place of the issues while they are shown. */
+function showDetails(open: boolean): void {
+  $("done-details").hidden = !open;
+  $("done-issues").hidden = open;
+  $("details-copy").hidden = !open;
+  $("details-copy").textContent = t("copyDetails");
+  $("details-toggle").setAttribute("aria-expanded", String(open));
+}
+
+/** Issues as title and advice; further notes in plain text below. */
+function renderIssues(list: HTMLElement, issues: Issue[], notes: Msg[]): void {
+  list.replaceChildren();
+  for (const issue of issues) {
+    const li = document.createElement("li");
+    li.className = `issue ${issue.kind}`;
+    const title = document.createElement("b");
+    title.textContent = issueTitle(issue.kind);
+    const text = document.createElement("p");
+    text.textContent = issueText(issue);
+    li.append(title, text);
+    list.append(li);
+  }
+  for (const m of notes) {
+    const li = document.createElement("li");
+    li.className = "note";
+    li.textContent = msgText(m);
+    list.append(li);
+  }
 }
 
 function summaryText(r: RunResult): string {
@@ -373,7 +489,11 @@ async function showScan(r: RunResult): Promise<void> {
           deleted: s.deleteCount,
           renamed: s.renameCount,
         });
-  $("scan-note").textContent = [t("unchanged", { n: s.unchangedCount }), ...r.messages.map(msgText)].join(" ");
+  $("scan-note").textContent = t("unchanged", { n: s.unchangedCount });
+  // What a mirror could not do, in one line above the list.
+  const notes = [...r.issues.map((i) => `${issueTitle(i.kind)} (${fmt.count(i.count)})`), ...r.messages.map(msgText)];
+  $("scan-issues").hidden = notes.length === 0;
+  $("scan-issues").textContent = notes.join(" · ");
   $("count-copy").textContent = fmt.count(s.copyCount);
   $("count-delete").textContent = fmt.count(s.deleteCount);
   $("count-rename").textContent = fmt.count(s.renameCount);
@@ -443,6 +563,20 @@ async function notify(body: string): Promise<void> {
   if (await isPermissionGranted()) sendNotification({ title: "DinoCopy", body });
 }
 
+/** Puts text on the clipboard (with a fallback for older web views). */
+async function copyText(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    document.body.append(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
+}
+
 function load<T>(key: string): T | null {
   try {
     const raw = localStorage.getItem(key);
@@ -461,6 +595,15 @@ function wire(): void {
     $<HTMLButtonElement>("cancel").disabled = true;
     $("run-phase").textContent = t("cancelling");
     void invoke("cancel");
+  });
+  $("done-retry").addEventListener("click", () => void start("mirror"));
+  $("details-toggle").addEventListener("click", () => showDetails($("done-details").hidden === true));
+  $("details-copy").addEventListener("click", async () => {
+    await copyText($("done-details").textContent ?? "");
+    $("details-copy").textContent = t("detailsCopied");
+  });
+  void win.onFocusChanged(({ payload: focused }) => {
+    if (focused) void refreshVolumes();
   });
   $("done-ok").addEventListener("click", async () => {
     show("setup");
@@ -491,6 +634,7 @@ function wire(): void {
   void listen<Phase>("run://phase", (e) => onPhase(e.payload));
   void listen<number>("run://scan-progress", (e) => onScanProgress(e.payload));
   void listen<Progress>("run://progress", (e) => onProgress(e.payload));
+  void listen<IssueKind[]>("run://issues", (e) => onIssues(e.payload));
   void listen<RunResult>("run://done", (e) => void onDone(e.payload));
 
   // Closing the window mid-run cancels first, so that no temp files are left
@@ -503,17 +647,24 @@ function wire(): void {
   });
 }
 
-/** Free space changes between runs: refresh it for remembered disks. */
+/**
+ * Remembered disks: current free space, or "not connected". Runs at start
+ * and whenever the window comes to the front (a disk may have been plugged
+ * in or out meanwhile).
+ */
 async function refreshVolumes(): Promise<void> {
-  const volumes = await invoke<Volume[]>("list_volumes").catch(() => []);
+  if (state.running) return;
+  const volumes = await invoke<Volume[] | null>("list_volumes").catch(() => null);
+  if (!volumes) return;
   for (const side of ["source", "target"] as const) {
     const choice = state[side];
-    const v = volumes.find((v) => v.path === choice?.path);
-    if (choice?.kind !== "volume" || !v) continue;
-    state[side] = { ...choice, free: v.availableBytes, total: v.totalBytes };
+    if (choice?.kind !== "volume") continue;
+    const v = volumes.find((v) => v.path === choice.path);
+    state[side] = v ? { ...choice, free: v.availableBytes, total: v.totalBytes, offline: false } : { ...choice, offline: true };
     localStorage.setItem(side, JSON.stringify(state[side]));
     renderPicker(side);
   }
+  if (!$("setup").hidden) void validate();
 }
 
 setLanguage(await invoke<string[]>("locales").catch(() => [...navigator.languages]));

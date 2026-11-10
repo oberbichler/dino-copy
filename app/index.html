@@ -57,6 +57,7 @@
         <div class="stat"><span class="stat-label" data-i18n="speed">Speed</span><span id="run-rate" class="stat-value">–</span></div>
       </div>
       <p id="run-current" class="current"></p>
+      <p id="run-issues" class="run-issues" hidden></p>
       </div>
       <footer class="footer">
         <span class="hint"></span>
@@ -66,14 +67,22 @@
 
     <!-- 3 · Finished -->
     <section id="done" class="view" hidden>
-      <div class="panel done-body">
-        <span id="done-icon" class="done-icon" aria-hidden="true"></span>
-        <p id="done-headline" class="headline"></p>
-        <p id="done-summary" class="secondary"></p>
-        <ul id="done-messages" class="messages"></ul>
+      <div id="done-body" class="panel done-body">
+        <div class="done-head">
+          <span id="done-icon" class="done-icon" aria-hidden="true"></span>
+          <div class="done-text">
+            <p id="done-headline" class="headline"></p>
+            <p id="done-summary" class="secondary"></p>
+          </div>
+        </div>
+        <ul id="done-issues" class="issues"></ul>
+        <pre id="done-details" class="details" hidden></pre>
       </div>
       <footer class="footer">
+        <button id="details-toggle" class="link" type="button" aria-expanded="false" data-i18n="details" hidden>Details</button>
+        <button id="details-copy" class="link" type="button" data-i18n="copyDetails" hidden>Copy</button>
         <span class="hint"></span>
+        <button id="done-retry" type="button" hidden></button>
         <button id="done-ok" class="primary" type="button" data-i18n="done">Done</button>
       </footer>
     </section>
@@ -85,6 +94,7 @@
         <p id="scan-caption" class="caption"></p>
         <p id="scan-summary" class="headline"></p>
         <p id="scan-note" class="secondary"></p>
+        <p id="scan-issues" class="scan-issues" hidden></p>
       </header>
       <div class="toolbar">
         <div class="chips" role="group" aria-label="Show">

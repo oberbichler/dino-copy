@@ -18,6 +18,7 @@ compile_error!(
 pub mod filter;
 pub mod guard;
 pub mod plan;
+pub mod problem;
 pub mod sync;
 pub mod walk;
 #[cfg(test)]

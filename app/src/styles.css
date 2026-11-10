@@ -306,6 +306,15 @@ button.primary {
   font-weight: 600;
 }
 
+/* A remembered disk that is not connected: faded, with a plain note. */
+.tile.offline .disk-icon {
+  opacity: 0.35;
+}
+
+.tile.offline .tile-detail {
+  color: var(--orange);
+}
+
 .tile.empty .tile-name {
   font-weight: 400;
   color: var(--secondary);
@@ -360,6 +369,10 @@ button.primary {
 
 .run-panel {
   justify-content: center;
+}
+
+.run-panel > * {
+  flex: none;
 }
 
 .eta {
@@ -442,6 +455,28 @@ button.primary {
   text-overflow: ellipsis;
 }
 
+.run-issues {
+  margin-top: 8px;
+  padding-left: 16px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--orange);
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1.5 15 14H1z' fill='%23e07b00'/%3E%3Cpath d='M8 6v4' stroke='%23fff' stroke-width='1.6' stroke-linecap='round'/%3E%3Ccircle cx='8' cy='12' r='.9' fill='%23fff'/%3E%3C/svg%3E")
+    left 2px / 12px no-repeat;
+}
+
+.run-issues[hidden],
+.scan-issues[hidden] {
+  display: none;
+}
+
+.scan-issues {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--orange);
+}
+
 .current {
   margin-top: 8px;
   font-size: 11px;
@@ -461,18 +496,17 @@ button.primary {
   text-align: center;
 }
 
-.done-body .headline {
+.done-head {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.done-text .headline {
   margin-top: 12px;
 }
 
-/* With messages, the icon steps back so that they get the room. */
-.done-body:has(.messages:not(:empty)) .done-icon {
-  width: 32px;
-  height: 32px;
-  background-size: 16px;
-}
-
-.done-body .secondary {
+.done-text .secondary {
   margin-top: 4px;
 }
 
@@ -501,31 +535,131 @@ button.primary {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m7.5 7.5 9 9m0-9-9 9' stroke='%23fff' stroke-width='2.6' stroke-linecap='round'/%3E%3C/svg%3E");
 }
 
-.messages {
-  align-self: stretch;
-  /* Shrinks first when the panel is short; scrolls within. */
+/* With problems to explain: a compact head (icon beside the text), the
+   problems below it, everything left-aligned and readable top to bottom. */
+.done-body.has-issues {
+  align-items: stretch;
+  justify-content: flex-start;
   text-align: left;
-  margin: 16px 0 0;
-  padding: 8px 12px 8px 24px;
+  gap: 16px;
+}
+
+.has-issues .done-head {
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+}
+
+.has-issues .done-icon {
+  width: 32px;
+  height: 32px;
+  background-size: 16px;
+}
+
+.has-issues .done-text .headline {
+  margin-top: 0;
+}
+
+.issues {
+  margin: 0;
+  padding: 0;
+  list-style: none;
   min-height: 0;
-  max-height: 260px;
-  flex-shrink: 1;
   overflow: auto;
-  font-size: 11px;
-  line-height: 15px;
-  color: var(--secondary);
-  background: var(--fill);
-  border-radius: var(--radius);
   -webkit-user-select: text;
   user-select: text;
 }
 
-.messages li + li {
-  margin-top: 4px;
+.issues:empty {
+  display: none;
 }
 
-.messages:empty {
+.issue {
+  position: relative;
+  padding: 10px 0 10px 20px;
+  border-top: 0.5px solid var(--separator);
+}
+
+.issue:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+/* A small dot marks each problem; the most serious ones in red. */
+.issue::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 15px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--orange);
+}
+
+.issue:first-child::before {
+  top: 5px;
+}
+
+.issue.targetFull::before,
+.issue.readOnly::before {
+  background: var(--red);
+}
+
+.issue b {
+  display: block;
+  font-weight: 600;
+}
+
+.issue p {
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--secondary);
+}
+
+.note {
+  padding: 8px 0 0 20px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--secondary);
+}
+
+/* Technical lines, for those who want them. */
+.details {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border-radius: var(--radius);
+  background: var(--fill);
+  font: 11px/15px ui-monospace, "SF Mono", Menlo, monospace;
+  color: var(--secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.details[hidden],
+.issues[hidden],
+.current[hidden] {
   display: none;
+}
+
+/* A quiet text button ("Details"). */
+button.link {
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  box-shadow: none;
+  color: var(--accent);
+}
+
+button.link[aria-expanded="true"] {
+  color: var(--secondary);
 }
 
 /* ---------- 4 · scan ---------- */

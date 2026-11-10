@@ -7,11 +7,14 @@
 
 use dino_copy_core::filter::Filter;
 use dino_copy_core::guard;
+use dino_copy_core::problem::{Action, Problem};
 use dino_copy_core::sync::{self, ProgressSink};
 use dino_copy_core::walk::{
     self, DetailKind, ExecOptions, Plan, PlanObserver, PlanOptions, Roots, SkipReason,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,8 +36,9 @@ pub const MACOS_SYSTEM_FOLDERS: &[&str] = &[
 const JOBS: usize = 2;
 /// How often progress is sent to the window.
 const TICK: Duration = Duration::from_millis(250);
-/// Error messages passed on to the window (the total is always reported).
-const MAX_MESSAGES: usize = 50;
+/// Technical problem lines passed on to the window (the counts in the
+/// issues are always complete).
+const MAX_DETAILS: usize = 200;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -139,30 +143,127 @@ struct ScanItem {
 #[serde(tag = "key", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Msg {
     // Why a pair cannot be started.
-    SourceMissing { path: String },
-    TargetMissing { path: String },
-    Unresolvable { path: String },
+    SourceMissing {
+        path: String,
+    },
+    TargetMissing {
+        path: String,
+    },
+    Unresolvable {
+        path: String,
+    },
     Identical,
     TargetInsideSource,
     SourceInsideTarget,
     RunInProgress,
     // Headlines.
     CancelledUnchanged,
-    SourceEmpty { entries: u64 },
+    SourceEmpty {
+        entries: u64,
+    },
     ScanNothingToDo,
     ScanFinished,
     InSync,
     CancelledPartly,
-    FinishedWithErrors { count: u64 },
+    FinishedWithErrors {
+        count: u64,
+    },
     FinishedIncomplete,
-    Mirrored { target: String, source: String },
+    Mirrored {
+        target: String,
+        source: String,
+    },
     // Further messages.
-    DeletionsWillBeSkipped { count: u64, unreadable: u64, collisions: u64 },
-    RootMetaFailed { error: String },
-    SkippedAfterFailures { count: u64 },
-    SkippedUnreadable { count: u64 },
-    SkippedChanged { count: u64 },
-    Detail { text: String },
+    DeletionsWillBeSkipped {
+        count: u64,
+        unreadable: u64,
+        collisions: u64,
+    },
+    RootMetaFailed {
+        error: String,
+    },
+    SkippedAfterFailures {
+        count: u64,
+    },
+    SkippedUnreadable {
+        count: u64,
+    },
+    SkippedChanged {
+        count: u64,
+    },
+    Detail {
+        text: String,
+    },
+}
+
+/// A kind of problem, as the user sees it: what went wrong and what to do.
+/// The order is the order of importance in the window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IssueKind {
+    /// The target has no space left.
+    TargetFull,
+    /// The target cannot be written at all.
+    ReadOnly,
+    /// macOS denied access (privacy settings or permissions).
+    NoPermission,
+    /// A file is too large for the target's file system (FAT32: 4 GB).
+    TooLarge,
+    /// A name the target's file system does not allow.
+    BadName,
+    /// Names that differ only in case or normalization.
+    NameClash,
+    /// A folder that could not be read.
+    Unreadable,
+    /// Something changed or vanished while the run was going on.
+    Changed,
+    /// Anything else (I/O errors, a disk that went away, ...).
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Issue {
+    kind: IssueKind,
+    count: u64,
+}
+
+/// How a problem shows up in the window; `None` for harmless notes.
+fn issue_kind(p: &Problem) -> Option<IssueKind> {
+    use IssueKind::*;
+    Some(match (&p.action, p.error) {
+        (Action::Vanished { .. } | Action::SpecialFile | Action::Suppressed, _) => return None,
+        (Action::Collision, _) => NameClash,
+        (_, Some(ErrorKind::StorageFull | ErrorKind::QuotaExceeded)) => TargetFull,
+        (_, Some(ErrorKind::ReadOnlyFilesystem)) => ReadOnly,
+        (_, Some(ErrorKind::PermissionDenied)) => NoPermission,
+        (_, Some(ErrorKind::FileTooLarge)) => TooLarge,
+        (_, Some(ErrorKind::InvalidFilename)) => BadName,
+        (Action::Unreadable, _) => Unreadable,
+        (Action::TypeChanged, _) | (_, Some(ErrorKind::NotFound)) => Changed,
+        _ => Other,
+    })
+}
+
+/// Problems grouped by kind, most important first. The engine stores only
+/// the first problems of a run; `uncounted` further failures are added to the
+/// most frequent kind (mass failures are nearly always of one kind, such as a
+/// full target).
+fn issues(problems: &[Problem], uncounted: u64) -> Vec<Issue> {
+    let mut counts: BTreeMap<IssueKind, u64> = BTreeMap::new();
+    for kind in problems.iter().filter_map(issue_kind) {
+        *counts.entry(kind).or_default() += 1;
+    }
+    if uncounted > 0 {
+        let top = counts
+            .iter()
+            .max_by_key(|&(_, n)| *n)
+            .map_or(IssueKind::Other, |(k, _)| *k);
+        *counts.entry(top).or_default() += uncounted;
+    }
+    counts
+        .into_iter()
+        .map(|(kind, count)| Issue { kind, count })
+        .collect()
 }
 
 #[derive(Clone, Serialize)]
@@ -172,8 +273,13 @@ struct RunResult {
     outcome: Outcome,
     /// One line for the headline.
     headline: Msg,
-    /// Errors and warnings worth showing (capped at [`MAX_MESSAGES`]).
+    /// What went wrong, grouped for the user.
+    issues: Vec<Issue>,
+    /// Further notes (deletions skipped, ...).
     messages: Vec<Msg>,
+    /// Every problem as a technical line, for "Details" (capped at
+    /// [`MAX_DETAILS`]).
+    details: Vec<String>,
     summary: Summary,
     duration_secs: f64,
     /// Planned changes (scan only).
@@ -267,15 +373,24 @@ fn run<R: Runtime>(
         mtime_tol: 2,
         cancel: Some(cancel),
     };
-    let finish = |outcome, headline: Msg, messages, summary, items| RunResult {
-        mode,
-        outcome,
-        headline,
-        messages,
-        summary,
-        duration_secs: started.elapsed().as_secs_f64(),
-        items,
-    };
+    let finish =
+        |outcome, headline: Msg, messages, problems: &[Problem], uncounted: u64, summary, items| {
+            RunResult {
+                mode,
+                outcome,
+                headline,
+                issues: issues(problems, uncounted),
+                messages,
+                details: problems
+                    .iter()
+                    .take(MAX_DETAILS)
+                    .map(ToString::to_string)
+                    .collect(),
+                summary,
+                duration_secs: started.elapsed().as_secs_f64(),
+                items,
+            }
+        };
 
     // Pass 1.
     phase(app, Phase::Scanning);
@@ -290,13 +405,16 @@ fn run<R: Runtime>(
         },
         Some(&observer),
     );
-    let mut messages = observer.take_warnings();
+    let mut problems = observer.take_warnings();
+    let mut messages = Vec::new();
     let summary = summary_of(&plan);
     if plan.cancelled {
         return finish(
             Outcome::Cancelled,
             Msg::CancelledUnchanged,
             messages,
+            &problems,
+            0,
             summary,
             None,
         );
@@ -311,6 +429,8 @@ fn run<R: Runtime>(
                 entries: target_entries,
             },
             messages,
+            &problems,
+            0,
             summary,
             None,
         );
@@ -331,7 +451,15 @@ fn run<R: Runtime>(
         } else {
             Msg::ScanFinished
         };
-        return finish(Outcome::Scanned, headline, messages, summary, Some(items));
+        return finish(
+            Outcome::Scanned,
+            headline,
+            messages,
+            &problems,
+            0,
+            summary,
+            Some(items),
+        );
     }
 
     if plan.stats.is_noop() && !sync::root_meta_differs(src, dst, 2) {
@@ -340,13 +468,7 @@ fn run<R: Runtime>(
         } else {
             Outcome::InSync
         };
-        return finish(
-            outcome,
-            Msg::InSync,
-            messages,
-            summary,
-            None,
-        );
+        return finish(outcome, Msg::InSync, messages, &problems, 0, summary, None);
     }
 
     // Pass 2.
@@ -354,7 +476,7 @@ fn run<R: Runtime>(
     let sink = Sink::new(app, plan.stats.copy_bytes, plan.stats.copy_count);
     let errors = Mutex::new(Vec::new());
     let report = std::thread::scope(|s| {
-        let ticker = s.spawn(|| sink.tick_until_done());
+        let ticker = s.spawn(|| sink.tick_until_done(&errors));
         let report = walk::execute(
             &roots,
             &plan,
@@ -385,11 +507,12 @@ fn run<R: Runtime>(
     }
 
     let errs = errors.into_inner().unwrap();
-    messages.extend(
-        errs.iter()
-            .take(MAX_MESSAGES)
-            .map(|text| Msg::Detail { text: text.clone() }),
-    );
+    let stored = errs
+        .iter()
+        .filter(|p| p.action != Action::Suppressed)
+        .count() as u64;
+    let uncounted = report.failed.saturating_sub(stored);
+    problems.extend(errs);
     if let Some(reason) = report.skip_reason
         && let Some(msg) = skip_msg(reason, report.skipped_deletes)
     {
@@ -422,8 +545,9 @@ fn run<R: Runtime>(
             },
         )
     };
-    messages.truncate(MAX_MESSAGES);
-    finish(outcome, headline, messages, summary, None)
+    finish(
+        outcome, headline, messages, &problems, uncounted, summary, None,
+    )
 }
 
 fn summary_of(plan: &Plan) -> Summary {
@@ -514,7 +638,7 @@ struct Observer<'a, R: Runtime> {
     app: &'a AppHandle<R>,
     listed: AtomicU64,
     last_emit: Mutex<Instant>,
-    warnings: Mutex<Vec<Msg>>,
+    warnings: Mutex<Vec<Problem>>,
 }
 
 impl<'a, R: Runtime> Observer<'a, R> {
@@ -527,7 +651,7 @@ impl<'a, R: Runtime> Observer<'a, R> {
         }
     }
 
-    fn take_warnings(&self) -> Vec<Msg> {
+    fn take_warnings(&self) -> Vec<Problem> {
         std::mem::take(&mut *self.warnings.lock().unwrap())
     }
 }
@@ -542,13 +666,9 @@ impl<R: Runtime> PlanObserver for Observer<'_, R> {
         }
     }
     fn hashed(&self) {}
-    fn warning(&self, msg: &str) {
-        let mut w = self.warnings.lock().unwrap();
-        if w.len() < MAX_MESSAGES {
-            w.push(Msg::Detail {
-                text: msg.to_string(),
-            });
-        }
+    fn warning(&self, problem: &Problem) {
+        // Kept in full: the issue counts come from this list.
+        self.warnings.lock().unwrap().push(problem.clone());
     }
 }
 
@@ -580,10 +700,26 @@ impl<'a, R: Runtime> Sink<'a, R> {
     /// smoothed; the estimate takes whichever is slower to finish — the
     /// remaining bytes or the remaining files — so that many tiny files do
     /// not make it look almost done.
-    fn tick_until_done(&self) {
+    fn tick_until_done(&self, errors: &Mutex<Vec<Problem>>) {
         let mut est = Estimator::default();
+        let mut seen = 0;
         while !self.done.load(Ordering::Relaxed) {
             std::thread::sleep(TICK);
+            // New problems: tell the window right away (a full target should
+            // not wait for the end of a long run).
+            let kinds = {
+                let list = errors.lock().unwrap();
+                (list.len() != seen).then(|| {
+                    seen = list.len();
+                    issues(&list, 0)
+                        .into_iter()
+                        .map(|i| i.kind)
+                        .collect::<Vec<_>>()
+                })
+            };
+            if let Some(kinds) = kinds {
+                let _ = self.app.emit("run://issues", kinds);
+            }
             let p = est.update(
                 self.bytes.load(Ordering::Relaxed),
                 self.bytes_total,
@@ -704,8 +840,14 @@ mod tests {
         std::fs::create_dir(&a).unwrap();
         std::fs::create_dir(a.join("inner")).unwrap();
 
-        assert_eq!(check_pair(&a, &a.join("inner")), Err(Msg::TargetInsideSource));
-        assert_eq!(check_pair(&a.join("inner"), &a), Err(Msg::SourceInsideTarget));
+        assert_eq!(
+            check_pair(&a, &a.join("inner")),
+            Err(Msg::TargetInsideSource)
+        );
+        assert_eq!(
+            check_pair(&a.join("inner"), &a),
+            Err(Msg::SourceInsideTarget)
+        );
         assert_eq!(check_pair(&a, &a), Err(Msg::Identical));
         assert!(check_pair(&a, &tmp.path().join("missing")).is_err());
         let b = tmp.path().join("b");
@@ -744,7 +886,11 @@ mod tests {
         fs::write(src.join("photos/a.jpg"), b"aaaa").unwrap();
         fs::write(src.join("notes.txt"), b"notes").unwrap();
         fs::write(dst.join("stale.txt"), b"gone in source").unwrap();
-        Trees { _tmp: tmp, src, dst }
+        Trees {
+            _tmp: tmp,
+            src,
+            dst,
+        }
     }
 
     /// Runs like the Start button, and records the phase events.
@@ -752,7 +898,9 @@ mod tests {
         let app = tauri::test::mock_app();
         let phases = Arc::new(Mutex::new(Vec::new()));
         let seen = phases.clone();
-        app.listen_any("run://phase", move |e| seen.lock().unwrap().push(e.payload().to_string()));
+        app.listen_any("run://phase", move |e| {
+            seen.lock().unwrap().push(e.payload().to_string())
+        });
         let cancel = AtomicBool::new(cancelled);
         let result = run(app.handle(), mode, &t.src, &t.dst, &cancel);
         let phases = phases.lock().unwrap().clone();
@@ -765,7 +913,12 @@ mod tests {
 
         let (r, phases) = run_mock(&t, Mode::Mirror, false);
 
-        assert!(matches!(r.outcome, Outcome::Success), "{:?}: {:?}", r.headline, r.messages);
+        assert!(
+            matches!(r.outcome, Outcome::Success),
+            "{:?}: {:?}",
+            r.headline,
+            r.messages
+        );
         assert_eq!(fs::read(t.dst.join("photos/a.jpg")).unwrap(), b"aaaa");
         assert!(!t.dst.join("stale.txt").exists());
         assert_eq!(r.summary.copy_count, 2);
@@ -794,7 +947,12 @@ mod tests {
         let listed: Vec<(&str, &str)> = items.iter().map(|i| (i.k, i.p.as_str())).collect();
         assert_eq!(
             listed,
-            [("c", "notes.txt"), ("m", "photos"), ("c", "photos/a.jpg"), ("d", "stale.txt")]
+            [
+                ("c", "notes.txt"),
+                ("m", "photos"),
+                ("c", "photos/a.jpg"),
+                ("d", "stale.txt")
+            ]
         );
         assert!(!t.dst.join("notes.txt").exists());
         assert!(t.dst.join("stale.txt").exists());
@@ -820,7 +978,11 @@ mod tests {
         let (r, _) = run_mock(&t, Mode::Mirror, false);
 
         assert!(matches!(r.outcome, Outcome::Failed), "{:?}", r.headline);
-        assert!(matches!(r.headline, Msg::SourceEmpty { .. }), "{:?}", r.headline);
+        assert!(
+            matches!(r.headline, Msg::SourceEmpty { .. }),
+            "{:?}",
+            r.headline
+        );
         assert!(t.dst.join("stale.txt").exists());
     }
 
@@ -834,7 +996,12 @@ mod tests {
 
         let (r, _) = run_mock(&t, Mode::Mirror, false);
 
-        assert!(matches!(r.outcome, Outcome::Success), "{:?}: {:?}", r.headline, r.messages);
+        assert!(
+            matches!(r.outcome, Outcome::Success),
+            "{:?}: {:?}",
+            r.headline,
+            r.messages
+        );
         assert!(!t.dst.join(".fseventsd").exists(), "not copied");
         assert!(t.dst.join(".Spotlight-V100/index").exists(), "not deleted");
     }
@@ -852,7 +1019,10 @@ mod tests {
     #[test]
     fn messages_reach_the_window_as_key_and_camel_case_fields() {
         let json = |m: Msg| serde_json::to_value(m).unwrap();
-        assert_eq!(json(Msg::Identical), serde_json::json!({ "key": "identical" }));
+        assert_eq!(
+            json(Msg::Identical),
+            serde_json::json!({ "key": "identical" })
+        );
         assert_eq!(
             json(Msg::Mirrored {
                 target: "B".into(),
@@ -876,4 +1046,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn problems_are_grouped_by_what_the_user_can_do() {
+        let os = |code| std::io::Error::from_raw_os_error(code);
+        let io = |action, code| Problem::io(action, "x", &os(code));
+        let kinds = |ps: &[Problem]| ps.iter().map(issue_kind).collect::<Vec<_>>();
+        assert_eq!(
+            kinds(&[
+                io(Action::Copy, 28),       // ENOSPC
+                io(Action::Copy, 69),       // EDQUOT
+                io(Action::Mkdir, 30),      // EROFS
+                io(Action::Unreadable, 13), // EACCES: privacy settings
+                io(Action::Copy, 1),        // EPERM
+                io(Action::Copy, 27),       // EFBIG: FAT32
+                io(Action::Copy, 63),       // ENAMETOOLONG
+                io(Action::Unreadable, 5),  // EIO
+                io(Action::Copy, 2),        // ENOENT: vanished meanwhile
+                io(Action::Copy, 5),        // EIO
+            ]),
+            [
+                Some(IssueKind::TargetFull),
+                Some(IssueKind::TargetFull),
+                Some(IssueKind::ReadOnly),
+                Some(IssueKind::NoPermission),
+                Some(IssueKind::NoPermission),
+                Some(IssueKind::TooLarge),
+                Some(IssueKind::BadName),
+                Some(IssueKind::Unreadable),
+                Some(IssueKind::Changed),
+                Some(IssueKind::Other),
+            ]
+        );
+        assert_eq!(
+            kinds(&[
+                Problem::note(Action::Collision, "a", "x"),
+                Problem::note(Action::TypeChanged, "a", ""),
+                Problem::note(Action::Vanished { what: "entry" }, "a", ""),
+                Problem::note(Action::SpecialFile, "a", ""),
+            ]),
+            [
+                Some(IssueKind::NameClash),
+                Some(IssueKind::Changed),
+                None,
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn failures_beyond_the_stored_ones_count_towards_the_most_frequent_kind() {
+        let full = Problem::io(Action::Copy, "a", &std::io::Error::from_raw_os_error(28));
+        let eio = Problem::io(Action::Copy, "b", &std::io::Error::from_raw_os_error(5));
+        let list = [full.clone(), full, eio];
+        assert_eq!(
+            issues(&list, 500),
+            [
+                Issue {
+                    kind: IssueKind::TargetFull,
+                    count: 502
+                },
+                Issue {
+                    kind: IssueKind::Other,
+                    count: 1
+                },
+            ]
+        );
+        assert_eq!(
+            issues(&[], 3),
+            [Issue {
+                kind: IssueKind::Other,
+                count: 3
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_source_folder_is_reported_as_an_issue() {
+        let t = trees();
+        let locked = t.src.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("x"), b"x").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (r, _) = run_mock(&t, Mode::Mirror, false);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(r.outcome, Outcome::Incomplete), "{:?}", r.headline);
+        assert_eq!(
+            r.issues,
+            [Issue {
+                kind: IssueKind::NoPermission,
+                count: 1
+            }]
+        );
+        assert!(
+            r.details[0].starts_with("contents not readable: "),
+            "{:?}",
+            r.details
+        );
+        // Deletions are withheld while a folder is unreadable.
+        assert!(t.dst.join("stale.txt").exists());
+    }
 }
