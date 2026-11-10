@@ -80,13 +80,7 @@ jobs:
         with:
           name: ui-test-report
           path: app/playwright-report
-      # The cask the release writes to the tap must pass Homebrew's checks.
-      - name: Check the cask
-        run: |
-          mkdir -p "$RUNNER_TEMP/Casks"
-          packaging/cask.sh 0.0.0 "$(printf x | shasum -a 256 | cut -d' ' -f1)" > "$RUNNER_TEMP/Casks/dinocopy.rb"
-          brew style "$RUNNER_TEMP/Casks/dinocopy.rb"
 
-  # The disk image exactly as a release builds it.
+  # The disk image and the cask exactly as a release builds them.
   app-bundle:
     uses: ./.github/workflows/build-app.yml

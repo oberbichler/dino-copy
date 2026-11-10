@@ -3,8 +3,8 @@
 #
 #   app/packaging/cask.sh <version> <sha256 of DinoCopy.dmg>
 #
-# The release workflow (.github/workflows/publish-app.yml) writes the output to
-# Casks/dinocopy.rb in oberbichler/homebrew-tap.
+# .github/workflows/build-app.yml fills it in for the built disk image, and
+# publish-app.yml commits it to Casks/dinocopy.rb in oberbichler/homebrew-tap.
 set -eu
 
 if [ $# -ne 2 ]; then
