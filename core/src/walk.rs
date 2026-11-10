@@ -34,7 +34,7 @@
 //!   entries of an unreadable directory are unknown, not gone;
 //! - its name really is extra on the target, not an alias of a source name
 //!   that differs only in case or Unicode normalization
-//!   ([`Walker::resolve_aliases`]).
+//!   (`Walker::resolve_aliases`).
 //!
 //! Removals run after all copies; type conflicts are replaced as the walk
 //! reaches them (they are confirmed like removals).
