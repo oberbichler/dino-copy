@@ -32,6 +32,7 @@ cargo install --git https://github.com/oberbichler/dino-copy
 Desktop app (macOS 11 or newer, Apple Silicon and Intel):
 
 ```sh
+brew trust --cask oberbichler/tap/dinocopy   # once: Homebrew asks before loading casks from other taps
 brew install --cask oberbichler/tap/dinocopy
 ```
 
