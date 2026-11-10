@@ -23,8 +23,8 @@
   --orange: #e07b00;
   --radius: 6px;
   --radius-lg: 10px;
-  /* 20 px margin + 14 px window buttons + 20 px gap. */
-  --top: 54px;
+  /* 20 px margin + 12 px window buttons + 20 px gap. */
+  --top: 52px;
   color-scheme: light dark;
 }
 
@@ -409,7 +409,10 @@ button.primary {
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* Each column as wide as its value, spread across the panel: large
+     numbers ("123,456 of 987,654") fit without being cut. */
+  grid-template-columns: repeat(3, auto);
+  justify-content: space-between;
   gap: 20px;
   margin-top: 16px;
 }
@@ -500,11 +503,12 @@ button.primary {
 
 .messages {
   align-self: stretch;
+  /* Shrinks first when the panel is short; scrolls within. */
   text-align: left;
   margin: 16px 0 0;
   padding: 8px 12px 8px 24px;
   min-height: 0;
-  max-height: 96px;
+  max-height: 260px;
   flex-shrink: 1;
   overflow: auto;
   font-size: 11px;

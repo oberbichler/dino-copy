@@ -93,6 +93,7 @@ interface RunResult {
 }
 
 const SMALL = new LogicalSize(520, 320);
+const TALL = new LogicalSize(520, 480);
 const LARGE = new LogicalSize(880, 660);
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -101,7 +102,8 @@ const win = getCurrentWindow();
 const state = {
   source: load<Choice>("source"),
   target: load<Choice>("target"),
-  mode: (localStorage.getItem("mode") as Mode | null) ?? "mirror",
+  // Anything but a known mode (an older or damaged setting) means Mirror.
+  mode: (localStorage.getItem("mode") === "scan" ? "scan" : "mirror") as Mode,
   running: false,
   closeWhenDone: false,
   /** When copying began: the time estimate and the bar measure from here. */
@@ -117,10 +119,20 @@ function show(view: "setup" | "running" | "done" | "scan"): void {
   for (const id of ["setup", "running", "done", "scan"]) $(id).hidden = id !== view;
 }
 
-async function useLargeWindow(large: boolean): Promise<void> {
+/**
+ * small: setup, progress and a plain result; tall: a result with messages,
+ * so that they can be read; large (resizable): the scan list.
+ */
+let windowSize: "small" | "tall" | "large" = "small";
+
+async function setWindow(size: "small" | "tall" | "large"): Promise<void> {
+  // Unchanged size: leave the window where the user put it.
+  if (size === windowSize) return;
+  windowSize = size;
+  const large = size === "large";
   await win.setResizable(large);
   await win.setMinSize(large ? new LogicalSize(680, 460) : null);
-  await win.setSize(large ? LARGE : SMALL);
+  await win.setSize(size === "small" ? SMALL : size === "tall" ? TALL : LARGE);
   await win.center();
 }
 
@@ -255,7 +267,7 @@ async function start(mode: Mode): Promise<void> {
     return;
   }
   state.running = true;
-  if (!$("scan").hidden) await useLargeWindow(false);
+  await setWindow("small");
   show("running");
 }
 
@@ -332,6 +344,7 @@ async function onDone(r: RunResult): Promise<void> {
     $("done-messages").append(li);
   }
   show("done");
+  if (r.messages.length > 0) await setWindow("tall");
 }
 
 function summaryText(r: RunResult): string {
@@ -364,8 +377,10 @@ async function showScan(r: RunResult): Promise<void> {
   $("count-copy").textContent = fmt.count(s.copyCount);
   $("count-delete").textContent = fmt.count(s.deleteCount);
   $("count-rename").textContent = fmt.count(s.renameCount);
+  // Nothing to mirror: offer only Close.
+  $("scan-mirror").hidden = s.copyCount + s.deleteCount + s.renameCount === 0;
   show("scan");
-  await useLargeWindow(true);
+  await setWindow("large");
   scanView.load(r.items ?? []);
 }
 
@@ -447,13 +462,14 @@ function wire(): void {
     $("run-phase").textContent = t("cancelling");
     void invoke("cancel");
   });
-  $("done-ok").addEventListener("click", () => {
+  $("done-ok").addEventListener("click", async () => {
     show("setup");
+    await setWindow("small");
     void validate();
   });
   $("scan-close").addEventListener("click", async () => {
     show("setup");
-    await useLargeWindow(false);
+    await setWindow("small");
     void validate();
   });
   $("scan-mirror").addEventListener("click", () => void start("mirror"));
@@ -487,10 +503,24 @@ function wire(): void {
   });
 }
 
+/** Free space changes between runs: refresh it for remembered disks. */
+async function refreshVolumes(): Promise<void> {
+  const volumes = await invoke<Volume[]>("list_volumes").catch(() => []);
+  for (const side of ["source", "target"] as const) {
+    const choice = state[side];
+    const v = volumes.find((v) => v.path === choice?.path);
+    if (choice?.kind !== "volume" || !v) continue;
+    state[side] = { ...choice, free: v.availableBytes, total: v.totalBytes };
+    localStorage.setItem(side, JSON.stringify(state[side]));
+    renderPicker(side);
+  }
+}
+
 setLanguage(await invoke<string[]>("locales").catch(() => [...navigator.languages]));
 translatePage();
 wire();
 renderPicker("source");
 renderPicker("target");
+void refreshVolumes();
 renderMode();
 void validate();

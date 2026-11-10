@@ -53,7 +53,10 @@ type Args = Record<string, string | number>;
  * chosen by `args.n`; numbers are formatted for the language.
  */
 export function t(key: Key, args: Args = {}): string {
-  const entry: Entry = LANGUAGES[lang][key] ?? en[key];
+  const entry: Entry | undefined = LANGUAGES[lang][key] ?? en[key];
+  // An unknown key (only possible through unchecked data) shows as itself
+  // rather than breaking the window.
+  if (entry === undefined) return String(key);
   const text = typeof entry === "string" ? entry : pick(entry, Number(args.n ?? 0));
   return text.replace(/\{(\w+)\}/g, (all, name: string) => {
     const v = args[name];
