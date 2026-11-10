@@ -158,7 +158,7 @@ copy times, and the differences shrink; the faster scan remains.
 
 ## Desktop app (preview)
 
-`app/` holds a macOS app for the same job: pick the source and target disks
+`app/` holds DinoCopy, a macOS app for the same job: pick the source and target disks
 from a list, press **Mirror**, and watch the progress and the time left. The
 arrow next to the button switches to **Scan**, which shows every change a
 mirror would make as a tree or a list, with filters and a search, without

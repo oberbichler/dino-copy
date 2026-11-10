@@ -1,4 +1,4 @@
-// dino-copy desktop app: pick source and target, press Start, watch it run.
+// DinoCopy, the desktop app for dino-copy: pick source and target, press Start, watch it run.
 
 import { invoke } from "@tauri-apps/api/core";
 import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
@@ -440,7 +440,7 @@ function msgText(m: Msg): string {
 
 /** Tells the user a mirror has ended, in case the window is in the background. */
 async function notify(body: string): Promise<void> {
-  if (await isPermissionGranted()) sendNotification({ title: "dino-copy", body });
+  if (await isPermissionGranted()) sendNotification({ title: "DinoCopy", body });
 }
 
 function load<T>(key: string): T | null {

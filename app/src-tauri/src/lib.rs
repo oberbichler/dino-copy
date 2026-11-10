@@ -1,4 +1,4 @@
-//! Desktop app for dino-copy: pick two disks (or folders), press Start.
+//! DinoCopy, the desktop app for dino-copy: pick two disks (or folders), press Start.
 //!
 //! The window is a thin layer over `dino-copy-core`; every rule about what is
 //! copied and what may be deleted lives there. This crate adds:
@@ -70,5 +70,5 @@ pub fn run() {
             locales
         ])
         .run(tauri::generate_context!())
-        .expect("error while running dino-copy");
+        .expect("error while running DinoCopy");
 }
