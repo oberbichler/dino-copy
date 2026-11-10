@@ -156,12 +156,33 @@ checksum run 0.72 s, while the 300,000 tiny files get slower (53 s): parallel
 creation in one directory contends. On USB hard disks the disk dominates the
 copy times, and the differences shrink; the faster scan remains.
 
+## Desktop app (preview)
+
+`app/` holds a macOS app for the same job: pick the source and target disks
+from a list, press **Mirror**, and watch the progress and the time left. The
+arrow next to the button switches to **Scan**, which shows every change a
+mirror would make as a tree or a list, with filters and a search, without
+changing anything. The app uses the same engine and the same safety rules as
+the command line tool, and it leaves out the folders macOS keeps on every
+volume (`.Spotlight-V100`, `.fseventsd`, `.Trashes`, …).
+
+It is not released yet. To run it from source (Node.js and Rust required):
+
+```sh
+cd app
+npm install
+npm run tauri dev
+```
+
 ## Development
 
 ```sh
-cargo test      # unit, integration and property-based tests
-cargo clippy --all-targets
+cargo test --workspace   # unit, integration and property-based tests
+cargo clippy --workspace --all-targets
 ```
+
+The engine lives in `core/` (`dino-copy-core`), shared by the command line
+tool (`src/`) and the desktop app (`app/`, its own Cargo workspace).
 
 The core guarantees are checked by property-based tests (`src/walk_props.rs`):
 random source and target trees are mirrored and compared against an
