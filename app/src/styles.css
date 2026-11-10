@@ -23,6 +23,8 @@
   --orange: #e07b00;
   --radius: 6px;
   --radius-lg: 10px;
+  /* 20 px margin + 14 px window buttons + 20 px gap. */
+  --top: 54px;
   color-scheme: light dark;
 }
 
@@ -81,19 +83,20 @@ p {
 .titlebar {
   position: fixed;
   inset: 0 0 auto 0;
-  height: 28px;
+  height: var(--top);
   z-index: 10;
 }
 
 /* Every view: content on top, the footer below it. One rhythm throughout:
-   20 px window margin (32 at the top, clear of the window buttons) and
+   the window buttons sit 20 px from the top-left corner (tauri.conf.json),
+   the content starts 20 px below them; 20 px window margin elsewhere and
    20 px between the content and the footer. */
 .view {
   display: flex;
   flex-direction: column;
   gap: 20px;
   height: 100%;
-  padding: 32px 20px 20px;
+  padding: var(--top) 20px 20px;
 }
 
 /* A white surface holding a view's main content. */

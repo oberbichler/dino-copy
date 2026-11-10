@@ -92,7 +92,7 @@ interface RunResult {
   items?: ScanItem[];
 }
 
-const SMALL = new LogicalSize(520, 300);
+const SMALL = new LogicalSize(520, 320);
 const LARGE = new LogicalSize(880, 660);
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;

@@ -16,12 +16,13 @@
         "label": "main",
         "title": "dino-copy",
         "width": 520,
-        "height": 300,
+        "height": 320,
         "resizable": false,
         "maximizable": false,
         "center": true,
         "titleBarStyle": "Overlay",
-        "hiddenTitle": true
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 20, "y": 20 }
       }
     ],
     "security": {
