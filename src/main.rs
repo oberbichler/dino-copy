@@ -159,6 +159,8 @@ fn run() -> Result<()> {
         dst: &dest_root,
         filter: &filter,
         mtime_tol: cli.mtime_window,
+        // Ctrl-C ends the process (see the handler above) instead.
+        cancel: None,
     };
 
     // A fixed default rather than guessing the hardware: whether more
@@ -176,6 +178,7 @@ fn run() -> Result<()> {
             scan_jobs: cli.scan_jobs,
             checksum: cli.checksum,
             hash_jobs: effective_jobs,
+            details: false,
         },
         Some(&scan_progress),
     );
@@ -310,6 +313,8 @@ fn run() -> Result<()> {
              not readable (--ignore-errors forces them).",
             report.skipped_deletes, report.unreadable
         ),
+        // Only the desktop app cancels in-process.
+        Some(walk::SkipReason::Cancelled) => {}
         Some(walk::SkipReason::Unplanned { planned, found }) => {
             eprintln!(
                 "Warning: found {found} deletion(s) while mirroring that do not match \

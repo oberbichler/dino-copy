@@ -453,6 +453,7 @@ impl Setup {
             dst: &self.dst,
             filter: &self.filter,
             mtime_tol: MTIME_TOL,
+            cancel: None,
         }
     }
 
@@ -461,6 +462,7 @@ impl Setup {
             scan_jobs: 2,
             checksum,
             hash_jobs: 2,
+            details: false,
         };
         walk::plan(&self.roots(), opts, None)
     }
@@ -482,6 +484,36 @@ impl Setup {
 /// True if `p` is `r` or lies below it.
 fn within(p: &Path, r: &Path) -> bool {
     p.starts_with(r)
+}
+
+/// Sink that raises the cancel flag when the `after`-th copy starts.
+struct CancelAfter<'a> {
+    cancel: &'a std::sync::atomic::AtomicBool,
+    after: usize,
+    seen: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::sync::ProgressSink for CancelAfter<'_> {
+    fn add_bytes(&self, _n: u64) {}
+    fn set_current(&self, _worker: usize, _name: &str) {
+        use std::sync::atomic::Ordering;
+        if self.seen.fetch_add(1, Ordering::Relaxed) + 1 >= self.after {
+            self.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    fn set_done(&self, _worker: usize) {}
+    fn inc_files(&self) {}
+}
+
+/// Temp files of interrupted copies anywhere below `root`.
+fn temp_files(root: &Path) -> Vec<PathBuf> {
+    snapshot(root)
+        .into_keys()
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with(".dino-copy.tmp."))
+        })
+        .collect()
 }
 
 proptest! {
@@ -562,6 +594,45 @@ proptest! {
             }
         }
     }
+
+    /// Cancelling at an arbitrary point (after the n-th copy has started)
+    /// deletes nothing that was planned for removal and leaves no temp files.
+    #[test]
+    fn a_cancel_at_any_point_deletes_nothing_and_leaves_no_temp_files(
+        (src, dst) in tree_pair(),
+        exclude in any::<bool>(),
+        after in 0usize..12,
+        jobs in 1usize..4,
+    ) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let t = setup(&src, &dst, exclude);
+        let plan = t.plan(false);
+        let cancel = AtomicBool::new(after == 0);
+        let roots = Roots { cancel: Some(&cancel), ..t.roots() };
+        let sink = CancelAfter { cancel: &cancel, after, seen: AtomicUsize::new(0) };
+        let errors = Mutex::new(Vec::new());
+        let opts = ExecOptions {
+            jobs,
+            scan_jobs: 2,
+            fsync: false,
+            ignore_errors: false,
+            delete_budget: plan.stats.remove_count,
+        };
+
+        let report = walk::execute(&roots, &plan, opts, &sink, &errors);
+
+        prop_assert!(temp_files(&t.dst).is_empty(), "temp files left: {:?}", temp_files(&t.dst));
+        if report.cancelled {
+            for r in &plan.removals {
+                prop_assert!(
+                    fs::symlink_metadata(t.dst.join(r)).is_ok(),
+                    "{} was removed although the run was cancelled",
+                    r.display()
+                );
+            }
+            prop_assert_eq!(report.failed, 0, "a cancel is not a failure: {:?}", errors);
+        }
+    }
 }
 
 /// A writer keeps changing the source while pass 2 runs (files deleted,
@@ -591,6 +662,7 @@ fn source_churn_during_execute_deletes_only_planned_entries() {
         dst: &d,
         filter: &filter,
         mtime_tol: MTIME_TOL,
+        cancel: None,
     };
     let plan = walk::plan(
         &roots,
@@ -598,6 +670,7 @@ fn source_churn_during_execute_deletes_only_planned_entries() {
             scan_jobs: 4,
             checksum: false,
             hash_jobs: 2,
+            details: false,
         },
         None,
     );

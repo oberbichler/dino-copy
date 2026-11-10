@@ -13,7 +13,9 @@ pub enum EntryKind {
     File,
     Dir,
     /// A symlink. `target` is the (non-dereferenced) link target.
-    Symlink { target: PathBuf },
+    Symlink {
+        target: PathBuf,
+    },
 }
 
 /// Identity of a file system object: device and inode number.
@@ -29,7 +31,10 @@ pub struct FileId {
 impl FileId {
     pub fn of(meta: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
-        Self { dev: meta.dev(), ino: meta.ino() }
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
     }
 }
 
@@ -64,7 +69,12 @@ pub enum Op {
     /// A source directory. `create` when it is missing on the target (or was
     /// in the way as a different type); `meta_ok` when the target directory's
     /// mtime (within tolerance) and mode already match.
-    Dir { mtime: i64, mode: u32, create: bool, meta_ok: bool },
+    Dir {
+        mtime: i64,
+        mode: u32,
+        create: bool,
+        meta_ok: bool,
+    },
     /// Exists only on the target: remove it (a directory with its subtree).
     Remove { is_dir: bool },
     /// Symlink with the same target and mtime: nothing to do.
@@ -89,7 +99,10 @@ impl Child {
         self.conflict
             || matches!(
                 self.op,
-                Op::Copy { .. } | Op::Symlink { .. } | Op::Remove { .. } | Op::Dir { create: true, .. }
+                Op::Copy { .. }
+                    | Op::Symlink { .. }
+                    | Op::Remove { .. }
+                    | Op::Dir { create: true, .. }
             )
     }
 }
@@ -160,21 +173,39 @@ pub fn diff_dir(src: Listing, dst: Listing, mtime_tol: i64) -> Vec<Child> {
         match order {
             std::cmp::Ordering::Less => {
                 let (name, s) = s_it.next().unwrap();
-                out.push(Child { name, conflict: false, op: op_for(s, None, mtime_tol) });
+                out.push(Child {
+                    name,
+                    conflict: false,
+                    op: op_for(s, None, mtime_tol),
+                });
             }
             std::cmp::Ordering::Greater => {
                 let (name, d) = d_it.next().unwrap();
-                let op = Op::Remove { is_dir: d.kind == EntryKind::Dir };
-                out.push(Child { name, conflict: false, op });
+                let op = Op::Remove {
+                    is_dir: d.kind == EntryKind::Dir,
+                };
+                out.push(Child {
+                    name,
+                    conflict: false,
+                    op,
+                });
             }
             std::cmp::Ordering::Equal => {
                 let (name, s) = s_it.next().unwrap();
                 let (_, d) = d_it.next().unwrap();
                 if same_type(&s.kind, &d.kind) {
-                    out.push(Child { name, conflict: false, op: op_for(s, Some(&d), mtime_tol) });
+                    out.push(Child {
+                        name,
+                        conflict: false,
+                        op: op_for(s, Some(&d), mtime_tol),
+                    });
                 } else {
                     // Wrong type on the target: remove it, then create as new.
-                    out.push(Child { name, conflict: true, op: op_for(s, None, mtime_tol) });
+                    out.push(Child {
+                        name,
+                        conflict: true,
+                        op: op_for(s, None, mtime_tol),
+                    });
                 }
             }
         }
@@ -203,9 +234,10 @@ fn op_for(s: FileEntry, d: Option<&FileEntry>, mtime_tol: i64) -> Op {
             meta_ok: d.is_some_and(|d| (s.mtime - d.mtime).abs() <= mtime_tol && s.mode == d.mode),
         },
         EntryKind::File => match d {
-            Some(d) if unchanged(&s, d, mtime_tol) => {
-                Op::Same { size: s.size, mode: (s.mode != d.mode).then_some(s.mode) }
-            }
+            Some(d) if unchanged(&s, d, mtime_tol) => Op::Same {
+                size: s.size,
+                mode: (s.mode != d.mode).then_some(s.mode),
+            },
             _ => Op::Copy { size: s.size },
         },
         EntryKind::Symlink { target } => {
@@ -217,7 +249,10 @@ fn op_for(s: FileEntry, d: Option<&FileEntry>, mtime_tol: i64) -> Op {
             if same {
                 Op::Keep
             } else {
-                Op::Symlink { target, mtime: s.mtime }
+                Op::Symlink {
+                    target,
+                    mtime: s.mtime,
+                }
             }
         }
     }
@@ -246,16 +281,36 @@ mod tests {
     use super::*;
 
     fn file(name: &str, size: u64, mtime: i64) -> (OsString, FileEntry) {
-        (name.into(), FileEntry { kind: EntryKind::File, size, mtime, mode: 0o644, id: FileId::default() })
+        (
+            name.into(),
+            FileEntry {
+                kind: EntryKind::File,
+                size,
+                mtime,
+                mode: 0o644,
+                id: FileId::default(),
+            },
+        )
     }
     fn dir(name: &str) -> (OsString, FileEntry) {
-        (name.into(), FileEntry { kind: EntryKind::Dir, size: 0, mtime: 0, mode: 0o755, id: FileId::default() })
+        (
+            name.into(),
+            FileEntry {
+                kind: EntryKind::Dir,
+                size: 0,
+                mtime: 0,
+                mode: 0o755,
+                id: FileId::default(),
+            },
+        )
     }
     fn symlink(name: &str, target: &str) -> (OsString, FileEntry) {
         (
             name.into(),
             FileEntry {
-                kind: EntryKind::Symlink { target: PathBuf::from(target) },
+                kind: EntryKind::Symlink {
+                    target: PathBuf::from(target),
+                },
                 size: 0,
                 mtime: 0,
                 mode: 0o777,
@@ -264,7 +319,11 @@ mod tests {
         )
     }
     fn child(name: &str, conflict: bool, op: Op) -> Child {
-        Child { name: name.into(), conflict, op }
+        Child {
+            name: name.into(),
+            conflict,
+            op,
+        }
     }
 
     #[test]
@@ -275,26 +334,52 @@ mod tests {
 
     #[test]
     fn skips_unchanged_file() {
-        let out = diff_dir(vec![file("a.txt", 10, 100)], vec![file("a.txt", 10, 100)], 1);
-        assert_eq!(out, vec![child("a.txt", false, Op::Same { size: 10, mode: None })]);
+        let out = diff_dir(
+            vec![file("a.txt", 10, 100)],
+            vec![file("a.txt", 10, 100)],
+            1,
+        );
+        assert_eq!(
+            out,
+            vec![child(
+                "a.txt",
+                false,
+                Op::Same {
+                    size: 10,
+                    mode: None
+                }
+            )]
+        );
         assert!(!out[0].touches_parent());
     }
 
     #[test]
     fn copies_changed_size() {
-        let out = diff_dir(vec![file("a.txt", 20, 100)], vec![file("a.txt", 10, 100)], 1);
+        let out = diff_dir(
+            vec![file("a.txt", 20, 100)],
+            vec![file("a.txt", 10, 100)],
+            1,
+        );
         assert_eq!(out[0].op, Op::Copy { size: 20 });
     }
 
     #[test]
     fn mtime_within_tolerance_skips() {
-        let out = diff_dir(vec![file("a.txt", 10, 100)], vec![file("a.txt", 10, 101)], 1);
+        let out = diff_dir(
+            vec![file("a.txt", 10, 100)],
+            vec![file("a.txt", 10, 101)],
+            1,
+        );
         assert!(matches!(out[0].op, Op::Same { .. }));
     }
 
     #[test]
     fn mtime_beyond_tolerance_copies() {
-        let out = diff_dir(vec![file("a.txt", 10, 100)], vec![file("a.txt", 10, 103)], 1);
+        let out = diff_dir(
+            vec![file("a.txt", 10, 100)],
+            vec![file("a.txt", 10, 103)],
+            1,
+        );
         assert_eq!(out[0].op, Op::Copy { size: 10 });
     }
 
@@ -303,8 +388,17 @@ mod tests {
         let mut sf = file("a.txt", 10, 100);
         sf.1.mode = 0o600;
         let out = diff_dir(vec![sf], vec![file("a.txt", 10, 100)], 1);
-        assert_eq!(out[0].op, Op::Same { size: 10, mode: Some(0o600) });
-        assert!(!out[0].touches_parent(), "chmod does not change the parent's mtime");
+        assert_eq!(
+            out[0].op,
+            Op::Same {
+                size: 10,
+                mode: Some(0o600)
+            }
+        );
+        assert!(
+            !out[0].touches_parent(),
+            "chmod does not change the parent's mtime"
+        );
     }
 
     #[test]
@@ -325,7 +419,12 @@ mod tests {
         let out = diff_dir(vec![dir("sub")], vec![], 1);
         assert_eq!(
             out[0].op,
-            Op::Dir { mtime: 0, mode: 0o755, create: true, meta_ok: false }
+            Op::Dir {
+                mtime: 0,
+                mode: 0o755,
+                create: true,
+                meta_ok: false
+            }
         );
         assert!(out[0].touches_parent());
     }
@@ -333,7 +432,15 @@ mod tests {
     #[test]
     fn existing_dir_with_matching_meta_is_left_alone() {
         let out = diff_dir(vec![dir("sub")], vec![dir("sub")], 1);
-        assert_eq!(out[0].op, Op::Dir { mtime: 0, mode: 0o755, create: false, meta_ok: true });
+        assert_eq!(
+            out[0].op,
+            Op::Dir {
+                mtime: 0,
+                mode: 0o755,
+                create: false,
+                meta_ok: true
+            }
+        );
         assert!(!out[0].touches_parent());
     }
 
@@ -343,7 +450,15 @@ mod tests {
         d.1.mtime = 999;
         d.1.mode = 0o700;
         let out = diff_dir(vec![dir("sub")], vec![d], 1);
-        assert_eq!(out[0].op, Op::Dir { mtime: 0, mode: 0o755, create: false, meta_ok: false });
+        assert_eq!(
+            out[0].op,
+            Op::Dir {
+                mtime: 0,
+                mode: 0o755,
+                create: false,
+                meta_ok: false
+            }
+        );
     }
 
     #[test]
@@ -362,12 +477,22 @@ mod tests {
     #[test]
     fn new_symlink_is_created() {
         let out = diff_dir(vec![symlink("link", "target")], vec![], 1);
-        assert_eq!(out[0].op, Op::Symlink { target: PathBuf::from("target"), mtime: 0 });
+        assert_eq!(
+            out[0].op,
+            Op::Symlink {
+                target: PathBuf::from("target"),
+                mtime: 0
+            }
+        );
     }
 
     #[test]
     fn identical_symlink_is_skipped() {
-        let out = diff_dir(vec![symlink("link", "target")], vec![symlink("link", "target")], 1);
+        let out = diff_dir(
+            vec![symlink("link", "target")],
+            vec![symlink("link", "target")],
+            1,
+        );
         assert_eq!(out[0].op, Op::Keep);
         assert!(!out[0].touches_parent());
     }
@@ -379,7 +504,13 @@ mod tests {
         let mut dl = symlink("link", "target");
         dl.1.mtime = 500;
         let out = diff_dir(vec![sl], vec![dl], 1);
-        assert_eq!(out[0].op, Op::Symlink { target: PathBuf::from("target"), mtime: 100 });
+        assert_eq!(
+            out[0].op,
+            Op::Symlink {
+                target: PathBuf::from("target"),
+                mtime: 100
+            }
+        );
     }
 
     #[test]
@@ -394,8 +525,18 @@ mod tests {
 
     #[test]
     fn changed_symlink_target_is_recreated() {
-        let out = diff_dir(vec![symlink("link", "new")], vec![symlink("link", "old")], 1);
-        assert_eq!(out[0].op, Op::Symlink { target: PathBuf::from("new"), mtime: 0 });
+        let out = diff_dir(
+            vec![symlink("link", "new")],
+            vec![symlink("link", "old")],
+            1,
+        );
+        assert_eq!(
+            out[0].op,
+            Op::Symlink {
+                target: PathBuf::from("new"),
+                mtime: 0
+            }
+        );
     }
 
     #[test]
@@ -418,8 +559,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a");
         let b = tmp.path().join("b");
-        std::fs::File::create(&a).unwrap().write_all(b"aaaa").unwrap();
-        std::fs::File::create(&b).unwrap().write_all(b"bbbb").unwrap();
+        std::fs::File::create(&a)
+            .unwrap()
+            .write_all(b"aaaa")
+            .unwrap();
+        std::fs::File::create(&b)
+            .unwrap()
+            .write_all(b"bbbb")
+            .unwrap();
         assert_ne!(hash_file(&a).unwrap(), hash_file(&b).unwrap());
         assert_eq!(hash_file(&a).unwrap(), hash_file(&a).unwrap());
     }

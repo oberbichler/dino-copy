@@ -44,6 +44,14 @@ pub trait ProgressSink: Sync {
     /// metadata phases, which can take a while.
     fn set_done(&self, worker: usize);
     fn inc_files(&self);
+    /// The removals start now (`entries` with their subtrees). From here on
+    /// the run cannot be cancelled any more.
+    fn begin_removals(&self, _entries: u64) {}
+    /// True if the run should stop. Long copies check it between chunks and
+    /// abort (their temp file is removed).
+    fn cancelled(&self) -> bool {
+        false
+    }
 }
 
 /// No-op sink for tests.
@@ -60,7 +68,12 @@ impl ProgressSink for NullSink {
 /// Copies a single file from `src` to `dst` via temp+rename and applies the
 /// source's mtime/atime and permissions.
 /// With `fsync`, the file contents are flushed to disk before the rename.
-pub fn copy_file(src: &Path, dst: &Path, sink: &dyn ProgressSink, fsync: bool) -> anyhow::Result<u64> {
+pub fn copy_file(
+    src: &Path,
+    dst: &Path,
+    sink: &dyn ProgressSink,
+    fsync: bool,
+) -> anyhow::Result<u64> {
     // What is being copied is announced by `execute`, which knows the path
     // relative to the roots; here only absolute paths are available.
     // Directories are created by `execute` in phase 1; no create_dir_all per
@@ -286,7 +299,9 @@ fn copy_chunked(
         let (tx_empty, rx_empty) = sync_channel::<Vec<u8>>(COPY_BUFFERS);
         for _ in 0..COPY_BUFFERS {
             // Capacity == COPY_BUFFERS, so no send blocks or fails.
-            tx_empty.send(vec![0u8; COPY_CHUNK]).expect("empty channel has capacity");
+            tx_empty
+                .send(vec![0u8; COPY_CHUNK])
+                .expect("empty channel has capacity");
         }
 
         // Reader thread: reads ahead into recycled buffers.
@@ -315,9 +330,14 @@ fn copy_chunked(
         let mut total = 0u64;
         loop {
             match rx_full.recv() {
-                Err(_) => break,              // Reader done (EOF) -> everything written.
-                Ok(Err(e)) => return Err(e),  // Pass the read error through.
+                Err(_) => break,             // Reader done (EOF) -> everything written.
+                Ok(Err(e)) => return Err(e), // Pass the read error through.
                 Ok(Ok((buf, n))) => {
+                    // Large files take long: stop between chunks on cancel
+                    // (the caller removes the temp file).
+                    if sink.cancelled() {
+                        return Err(std::io::Error::other("cancelled"));
+                    }
                     writer.write_all(&buf[..n])?;
                     total += n as u64;
                     sink.add_bytes(n as u64);
@@ -393,13 +413,10 @@ pub fn mirror_root_meta(source_root: &Path, dest_root: &Path) -> std::io::Result
 /// difference.
 pub fn root_meta_differs(source_root: &Path, dest_root: &Path, mtime_tol: i64) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let (Ok(src), Ok(dst)) =
-        (std::fs::metadata(source_root), std::fs::metadata(dest_root))
-    else {
+    let (Ok(src), Ok(dst)) = (std::fs::metadata(source_root), std::fs::metadata(dest_root)) else {
         return true;
     };
-    (src.mtime() - dst.mtime()).abs() > mtime_tol
-        || (src.mode() & 0o7777) != (dst.mode() & 0o7777)
+    (src.mtime() - dst.mtime()).abs() > mtime_tol || (src.mode() & 0o7777) != (dst.mode() & 0o7777)
 }
 
 /// Sets the mtime + permissions of a directory.
@@ -506,7 +523,11 @@ mod tests {
 
         let n = copy_file(&src, &dst, &NullSink, false).unwrap();
         assert_eq!(n, size as u64);
-        assert_eq!(fs::read(&dst).unwrap(), data, "byte order must be preserved");
+        assert_eq!(
+            fs::read(&dst).unwrap(),
+            data,
+            "byte order must be preserved"
+        );
     }
 
     #[test]
@@ -520,14 +541,21 @@ mod tests {
         let src = tmp.path().join("mid.bin");
         let dst = tmp.path().join("mid.out");
         let size = 3 * 1024 * 1024 + 4321;
-        assert!((size as u64) < CHUNK_PROGRESS_THRESHOLD, "must take the small path");
+        assert!(
+            (size as u64) < CHUNK_PROGRESS_THRESHOLD,
+            "must take the small path"
+        );
         let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         fs::write(&src, &data).unwrap();
 
         let n = copy_file(&src, &dst, &NullSink, false).unwrap();
 
         assert_eq!(n, size as u64);
-        assert_eq!(fs::read(&dst).unwrap(), data, "byte order must be preserved");
+        assert_eq!(
+            fs::read(&dst).unwrap(),
+            data,
+            "byte order must be preserved"
+        );
     }
 
     #[test]
@@ -576,7 +604,10 @@ mod tests {
             }
             if let Ok(rd) = fs::read_dir(&self.dir) {
                 for e in rd.filter_map(|e| e.ok()) {
-                    if e.file_name().to_string_lossy().starts_with(".dino-copy.tmp.") {
+                    if e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".dino-copy.tmp.")
+                    {
                         if let Ok(m) = e.metadata() {
                             *seen = Some(m.mode() & 0o7777);
                         }
@@ -608,7 +639,11 @@ mod tests {
         };
         copy_file(&src, &dst, &spy, false).unwrap();
 
-        let seen = spy.seen_mode.lock().unwrap().expect("temp file not observed");
+        let seen = spy
+            .seen_mode
+            .lock()
+            .unwrap()
+            .expect("temp file not observed");
         assert_eq!(
             seen, 0o600,
             "the temp file must be created restrictively (0600), was {seen:o}"
@@ -630,8 +665,8 @@ mod tests {
         let dst = dst_dir.join(&long_name);
         fs::write(&src, b"payload").unwrap();
 
-        let n = copy_file(&src, &dst, &NullSink, false)
-            .expect("a copy with a long name must succeed");
+        let n =
+            copy_file(&src, &dst, &NullSink, false).expect("a copy with a long name must succeed");
         assert_eq!(n, 7);
         assert_eq!(fs::read(&dst).unwrap(), b"payload");
     }
@@ -705,7 +740,11 @@ mod tests {
         let leftover: Vec<_> = fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(".dino-copy.tmp."))
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".dino-copy.tmp.")
+            })
             .collect();
         assert!(leftover.is_empty(), "no stray temp files allowed");
         // Note: the global temp registry is not checked, since it is shared

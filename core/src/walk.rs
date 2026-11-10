@@ -65,14 +65,29 @@ pub struct Roots<'a> {
     pub dst: &'a Path,
     pub filter: &'a Filter,
     pub mtime_tol: i64,
+    /// Set to stop a run from another thread. A cancelled run starts no new
+    /// work, interrupts running copies (their temp files are removed) and
+    /// deletes nothing. `None` where the process itself ends on Ctrl-C.
+    pub cancel: Option<&'a AtomicBool>,
 }
 
-/// Progress callbacks of the plan pass.
-pub trait ScanProgress: Sync {
+impl Roots<'_> {
+    /// True once the run has been asked to stop.
+    pub fn cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+}
+
+/// Observer of the plan pass: progress and warnings. The command line tool
+/// prints them; the desktop app shows them.
+pub trait PlanObserver: Sync {
     /// `n` more entries were listed (source and target together).
     fn listed(&self, n: u64);
     /// One more file was verified by `--checksum`.
     fn hashed(&self);
+    /// Something the user should know but that does not stop the run, e.g.
+    /// an unreadable directory or a skipped special file.
+    fn warning(&self, msg: &str);
 }
 
 /// Reads one directory: its entries (filtered, sorted by name) or the error
@@ -86,7 +101,7 @@ pub fn read_listing(
     abs: &Path,
     rel: &Path,
     filter: &Filter,
-    warn: bool,
+    observer: Option<&dyn PlanObserver>,
 ) -> Result<Listing, String> {
     let rd = std::fs::read_dir(abs).map_err(|e| e.to_string())?;
     let mut names: Vec<OsString> = Vec::new();
@@ -101,7 +116,7 @@ pub fn read_listing(
     }
     let read: Vec<Result<Option<(OsString, FileEntry)>, String>> = names
         .into_par_iter()
-        .map(|name| read_entry(abs, name, warn))
+        .map(|name| read_entry(abs, name, observer))
         .collect();
     let mut out = Vec::with_capacity(read.len());
     for r in read {
@@ -118,17 +133,17 @@ pub fn read_listing(
 fn read_entry(
     dir: &Path,
     name: OsString,
-    warn: bool,
+    observer: Option<&dyn PlanObserver>,
 ) -> Result<Option<(OsString, FileEntry)>, String> {
     use std::os::unix::fs::MetadataExt;
 
     let path = dir.join(&name);
     let vanished = |what: &str| {
-        if warn {
-            eprintln!(
-                "Warning: skipping {what} (vanished during the scan): {}",
+        if let Some(o) = observer {
+            o.warning(&format!(
+                "skipping {what} (vanished during the scan): {}",
                 path.display()
-            );
+            ));
         }
     };
     // symlink_metadata does NOT follow the link: symlinks are mirrored as
@@ -156,8 +171,8 @@ fn read_entry(
         EntryKind::File
     } else {
         // File::open on a FIFO blocks until a writer connects -> deadlock.
-        if warn {
-            eprintln!("Warning: skipping special file {}", path.display());
+        if let Some(o) = observer {
+            o.warning(&format!("skipping special file {}", path.display()));
         }
         return Ok(None);
     };
@@ -311,24 +326,24 @@ trait Visitor<'a>: Sync {
     /// The source entry `rel` cannot be mirrored because the target file
     /// system resolves its name to a different entry (see
     /// [`Walker::resolve_aliases`]). The entry is left out of the run.
-    fn collision(&self, rel: &Path, why: &str);
+    fn collision(&self, w: &Walker<'_>, rel: &Path, why: &str);
 }
 
 /// One walk over source and target, driving a [`Visitor`].
 struct Walker<'r> {
     roots: &'r Roots<'r>,
-    /// Print warnings (only pass 1 does, pass 2 would repeat them).
-    warn: bool,
     unreadable: AtomicU64,
-    progress: Option<&'r dyn ScanProgress>,
+    /// Progress and warnings; only pass 1 has one (pass 2 would repeat the
+    /// warnings).
+    observer: Option<&'r dyn PlanObserver>,
 }
 
 impl Walker<'_> {
     fn list(&self, root: &Path, rel: &Path) -> Listing {
         let abs = root.join(rel);
-        match read_listing(&abs, rel, self.roots.filter, self.warn) {
+        match read_listing(&abs, rel, self.roots.filter, self.observer) {
             Ok(l) => {
-                if let Some(p) = self.progress {
+                if let Some(p) = self.observer {
                     p.listed(l.len() as u64);
                 }
                 l
@@ -344,8 +359,8 @@ impl Walker<'_> {
 
     fn report_unreadable(&self, abs: &Path, err: &str) {
         self.unreadable.fetch_add(1, Ordering::Relaxed);
-        if self.warn {
-            eprintln!("Warning: contents not readable: {} ({err})", abs.display());
+        if let Some(o) = self.observer {
+            o.warning(&format!("contents not readable: {} ({err})", abs.display()));
         }
     }
 
@@ -458,11 +473,12 @@ impl Walker<'_> {
                         "the target file system treats it as the same name as {:?}",
                         dst[j].0
                     );
-                    visitor.collision(&rel.join(name), &why);
+                    visitor.collision(self, &rel.join(name), &why);
                     false
                 }
                 None => {
                     visitor.collision(
+                        self,
                         &rel.join(name),
                         "the target file system resolves the name to an entry that \
                          cannot be identified unambiguously (excluded, hard-linked or \
@@ -483,6 +499,9 @@ impl Walker<'_> {
 
     /// Processes the directory `node` and, in parallel, everything below it.
     fn walk<'a>(&self, visitor: &dyn Visitor<'a>, node: Arc<DirNode<'a>>, dst_exists: bool) {
+        if self.roots.cancelled() {
+            return;
+        }
         let src = self.list(self.roots.src, &node.rel);
         let dst = if dst_exists {
             self.list(self.roots.dst, &node.rel)
@@ -542,6 +561,37 @@ pub struct PlanOptions {
     /// Parallelism of the checksum pass (it reads every byte twice, so it
     /// follows the copy parallelism instead of the scan parallelism).
     pub hash_jobs: usize,
+    /// Collect every planned change with its path ([`Plan::details`]) — for
+    /// showing a scan in detail. Off for a plain run: the list grows with the
+    /// number of changes.
+    pub details: bool,
+}
+
+/// One planned change, see [`PlanOptions::details`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Detail {
+    /// Relative path, in the source's spelling.
+    pub path: PathBuf,
+    pub kind: DetailKind,
+}
+
+/// What happens to the entry at [`Detail::path`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailKind {
+    /// A file is copied (new, changed, or a `--checksum` mismatch). Symlinks
+    /// appear here too, with size 0.
+    Copy { size: u64 },
+    /// A directory is created.
+    Mkdir,
+    /// A target entry without a source counterpart is deleted; `entries`
+    /// counts it with its whole subtree.
+    Remove { is_dir: bool, entries: u64 },
+    /// A target entry of another type is deleted (with its subtree) and
+    /// replaced by the source entry; that entry has its own `Copy`/`Mkdir`.
+    Replace,
+    /// The target entry is renamed to the source's spelling; `from` is its
+    /// current name.
+    Rename { from: OsString },
 }
 
 /// Result of [`plan`]: what a run would do, and the limits for [`execute`].
@@ -563,6 +613,20 @@ pub struct Plan {
     pub conflicts: BTreeSet<PathBuf>,
     /// Source entries left out because of a name collision on the target.
     pub collisions: u64,
+    /// Every planned change, if [`PlanOptions::details`] asked for it (in no
+    /// particular order).
+    pub details: Vec<Detail>,
+    /// The plan was cut short by [`Roots::cancel`]: its numbers are incomplete.
+    pub cancelled: bool,
+}
+
+impl Plan {
+    /// Whether deletions may run after this plan. They are withheld when the
+    /// plan is incomplete — directories could not be read, or source names
+    /// collide on the target — unless `ignore_errors` overrides that.
+    pub fn deletions_allowed(&self, ignore_errors: bool) -> bool {
+        ignore_errors || (self.unreadable == 0 && self.collisions == 0)
+    }
 }
 
 struct Planner {
@@ -572,6 +636,7 @@ struct Planner {
     removals: Mutex<BTreeSet<PathBuf>>,
     conflicts: Mutex<BTreeSet<PathBuf>>,
     collisions: AtomicU64,
+    details: Option<Mutex<Vec<Detail>>>,
 }
 
 impl<'a> Visitor<'a> for Planner {
@@ -596,7 +661,7 @@ impl<'a> Visitor<'a> for Planner {
                         || hash_file(&roots.src.join(&rel)),
                         || hash_file(&roots.dst.join(&rel)),
                     );
-                    if let Some(p) = w.progress {
+                    if let Some(p) = w.observer {
                         p.hashed();
                     }
                     !matches!((hs, hd), (Ok(a), Ok(b)) if a == b)
@@ -612,8 +677,24 @@ impl<'a> Visitor<'a> for Planner {
         };
         let mut touched = !renames.is_empty();
         let mut subdirs = Vec::new();
+        // Collected locally, appended under one lock per directory.
+        let mut details: Option<Vec<Detail>> = self.details.as_ref().map(|_| Vec::new());
+        let mut detail = |path: PathBuf, kind: DetailKind| {
+            if let Some(d) = details.as_mut() {
+                d.push(Detail { path, kind });
+            }
+        };
+        for r in renames {
+            detail(
+                node.rel.join(&r.to),
+                DetailKind::Rename {
+                    from: r.from.clone(),
+                },
+            );
+        }
         for (c, forced) in children.into_iter().zip(forced) {
             if c.conflict {
+                detail(node.rel.join(&c.name), DetailKind::Replace);
                 s.conflict_count += 1;
                 self.conflicts
                     .lock()
@@ -625,11 +706,13 @@ impl<'a> Visitor<'a> for Planner {
                 Op::Copy { size } => {
                     s.copy_count += 1;
                     s.copy_bytes += size;
+                    detail(node.rel.join(&c.name), DetailKind::Copy { size });
                 }
                 Op::Same { size, .. } if forced => {
                     s.copy_count += 1;
                     s.copy_bytes += size;
                     self.forced.lock().unwrap().insert(node.rel.join(&c.name));
+                    detail(node.rel.join(&c.name), DetailKind::Copy { size });
                 }
                 Op::Same { mode, .. } => {
                     s.skip_count += 1;
@@ -637,7 +720,10 @@ impl<'a> Visitor<'a> for Planner {
                         s.meta_count += 1;
                     }
                 }
-                Op::Symlink { .. } => s.copy_count += 1,
+                Op::Symlink { .. } => {
+                    s.copy_count += 1;
+                    detail(node.rel.join(&c.name), DetailKind::Copy { size: 0 });
+                }
                 Op::Keep => {}
                 Op::Dir {
                     mtime,
@@ -647,6 +733,7 @@ impl<'a> Visitor<'a> for Planner {
                 } => {
                     if create {
                         s.mkdir_count += 1;
+                        detail(node.rel.join(&c.name), DetailKind::Mkdir);
                     }
                     subdirs.push(SubDir {
                         node: node.child(&c.name, mtime, mode, meta_ok),
@@ -655,7 +742,9 @@ impl<'a> Visitor<'a> for Planner {
                 }
                 Op::Remove { is_dir } => {
                     let rel = node.rel.join(&c.name);
-                    s.remove_count += if is_dir { w.count_tree(&rel) } else { 1 };
+                    let entries = if is_dir { w.count_tree(&rel) } else { 1 };
+                    s.remove_count += entries;
+                    detail(rel.clone(), DetailKind::Remove { is_dir, entries });
                     self.removals.lock().unwrap().insert(rel);
                 }
             }
@@ -665,22 +754,26 @@ impl<'a> Visitor<'a> for Planner {
             s.dir_meta_count += 1;
         }
         self.stats.lock().unwrap().add(&s);
+        if let (Some(all), Some(mine)) = (&self.details, details) {
+            all.lock().unwrap().extend(mine);
+        }
         subdirs
     }
 
-    fn collision(&self, rel: &Path, why: &str) {
+    fn collision(&self, w: &Walker<'_>, rel: &Path, why: &str) {
         self.collisions.fetch_add(1, Ordering::Relaxed);
-        eprintln!("Warning: cannot mirror {}: {why}", rel.display());
+        if let Some(o) = w.observer {
+            o.warning(&format!("cannot mirror {}: {why}", rel.display()));
+        }
     }
 }
 
 /// Pass 1: walks both trees and counts what a run would do.
-pub fn plan(roots: &Roots, opts: PlanOptions, progress: Option<&dyn ScanProgress>) -> Plan {
+pub fn plan(roots: &Roots, opts: PlanOptions, observer: Option<&dyn PlanObserver>) -> Plan {
     let walker = Walker {
         roots,
-        warn: true,
         unreadable: AtomicU64::new(0),
-        progress,
+        observer,
     };
     let planner = Planner {
         checksum: opts.checksum,
@@ -689,8 +782,9 @@ pub fn plan(roots: &Roots, opts: PlanOptions, progress: Option<&dyn ScanProgress
         removals: Mutex::new(BTreeSet::new()),
         conflicts: Mutex::new(BTreeSet::new()),
         collisions: AtomicU64::new(0),
+        details: opts.details.then(|| Mutex::new(Vec::new())),
     };
-    let source_empty = match read_listing(roots.src, Path::new(""), roots.filter, false) {
+    let source_empty = match read_listing(roots.src, Path::new(""), roots.filter, None) {
         Ok(l) => l.is_empty(),
         Err(_) => true,
     };
@@ -711,6 +805,11 @@ pub fn plan(roots: &Roots, opts: PlanOptions, progress: Option<&dyn ScanProgress
         removals: planner.removals.into_inner().unwrap(),
         conflicts: planner.conflicts.into_inner().unwrap(),
         collisions: planner.collisions.into_inner(),
+        details: planner
+            .details
+            .map(|d| d.into_inner().unwrap())
+            .unwrap_or_default(),
+        cancelled: roots.cancelled(),
     }
 }
 
@@ -746,6 +845,8 @@ pub enum SkipReason {
     /// were confirmed): the trees changed in between — for instance, the
     /// source was unmounted. Nothing is removed then.
     Unplanned { planned: u64, found: u64 },
+    /// The run was cancelled ([`Roots::cancel`]) before the removals.
+    Cancelled,
 }
 
 /// Outcome of [`execute`].
@@ -759,6 +860,35 @@ pub struct ExecReport {
     pub skipped_deletes: u64,
     /// Why the removals were withheld; `None` if they ran (or none were due).
     pub skip_reason: Option<SkipReason>,
+    /// The run was cancelled ([`Roots::cancel`]): the target is incomplete.
+    pub cancelled: bool,
+}
+
+/// Wraps the caller's sink so that copies notice [`Roots::cancel`].
+struct CancelAware<'s> {
+    inner: &'s dyn ProgressSink,
+    cancel: Option<&'s AtomicBool>,
+}
+
+impl ProgressSink for CancelAware<'_> {
+    fn add_bytes(&self, n: u64) {
+        self.inner.add_bytes(n);
+    }
+    fn set_current(&self, worker: usize, name: &str) {
+        self.inner.set_current(worker, name);
+    }
+    fn set_done(&self, worker: usize) {
+        self.inner.set_done(worker);
+    }
+    fn inc_files(&self) {
+        self.inner.inc_files();
+    }
+    fn begin_removals(&self, entries: u64) {
+        self.inner.begin_removals(entries);
+    }
+    fn cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) || self.inner.cancelled()
+    }
 }
 
 struct ExecShared<'a> {
@@ -834,6 +964,9 @@ impl<'a> Visitor<'a> for Executor<'a> {
 
         let mut subdirs = Vec::new();
         for c in children {
+            if self.sink.cancelled() {
+                break;
+            }
             let forced = is_forced(&c);
             let rel = node.rel.join(&c.name);
             let target = w.roots.dst.join(&rel);
@@ -901,7 +1034,7 @@ impl<'a> Visitor<'a> for Executor<'a> {
         subdirs
     }
 
-    fn collision(&self, rel: &Path, why: &str) {
+    fn collision(&self, _: &Walker<'_>, rel: &Path, why: &str) {
         self.shared
             .fail(format!("cannot mirror {}: {why}", rel.display()));
     }
@@ -909,6 +1042,9 @@ impl<'a> Visitor<'a> for Executor<'a> {
 
 impl<'a> Executor<'a> {
     fn queue_copy(&self, rel: PathBuf, node: &Arc<DirNode<'a>>) {
+        if self.sink.cancelled() {
+            return;
+        }
         // Blocks while the queue is full: the walk never runs further ahead
         // of the copies than COPY_QUEUE entries.
         let _ = self.copies.send(CopyJob {
@@ -936,6 +1072,10 @@ pub fn execute(
     sink: &dyn ProgressSink,
     errors: &Mutex<Vec<String>>,
 ) -> ExecReport {
+    let sink = &CancelAware {
+        inner: sink,
+        cancel: roots.cancel,
+    };
     let shared = ExecShared {
         dst_root: roots.dst,
         fsync: opts.fsync,
@@ -948,9 +1088,8 @@ pub fn execute(
     };
     let walker = Walker {
         roots,
-        warn: false,
         unreadable: AtomicU64::new(0),
-        progress: None,
+        observer: None,
     };
     let jobs = opts.jobs.max(1);
 
@@ -964,11 +1103,18 @@ pub fn execute(
                     // The lock is only held for the recv, not for the copy.
                     let job = rx.lock().unwrap().recv();
                     let Ok(job) = job else { break };
+                    // After a cancel the queue is drained without copying.
+                    if sink.cancelled() {
+                        continue;
+                    }
                     sink.set_current(worker, &job.rel.to_string_lossy());
                     let src = roots.src.join(&job.rel);
                     let dst = roots.dst.join(&job.rel);
                     if let Err(e) = sync::copy_file(&src, &dst, sink, opts.fsync) {
-                        shared.fail(format!("copy {}: {e}", job.rel.display()));
+                        // A copy interrupted by the cancel is not a failure.
+                        if !sink.cancelled() {
+                            shared.fail(format!("copy {}: {e}", job.rel.display()));
+                        }
                     }
                     // Dropping the job may complete its directory (metadata).
                     drop(job);
@@ -999,10 +1145,13 @@ pub fn execute(
 
     let mut report = ExecReport {
         unreadable,
+        cancelled: sink.cancelled(),
         ..Default::default()
     };
     if !removes.is_empty() {
-        report.skip_reason = if failed_before > 0 && !opts.ignore_errors {
+        report.skip_reason = if report.cancelled {
+            Some(SkipReason::Cancelled)
+        } else if failed_before > 0 && !opts.ignore_errors {
             Some(SkipReason::FailedActions)
         } else if unreadable > 0 && !opts.ignore_errors {
             Some(SkipReason::Unreadable)
@@ -1019,6 +1168,9 @@ pub fn execute(
         if report.skip_reason.is_some() {
             report.skipped_deletes = found;
         } else {
+            // From here on the run is no longer cancellable: a half-done
+            // removal phase is worse than a finished one.
+            sink.begin_removals(found);
             for (rel, is_dir) in removes {
                 let target = roots.dst.join(&rel);
                 let res = if is_dir {
@@ -1063,6 +1215,7 @@ mod tests {
             dst: d,
             filter,
             mtime_tol: 2,
+            cancel: None,
         }
     }
 
@@ -1074,6 +1227,7 @@ mod tests {
                 scan_jobs: 2,
                 checksum: false,
                 hash_jobs: 2,
+                details: false,
             },
             None,
         )
@@ -1131,7 +1285,7 @@ mod tests {
         fs::write(s.join("b.txt"), b"hello").unwrap();
         fs::write(s.join("a.txt"), b"hi").unwrap();
 
-        let l = read_listing(&s, Path::new(""), &Filter::default(), false).unwrap();
+        let l = read_listing(&s, Path::new(""), &Filter::default(), None).unwrap();
 
         let names: Vec<_> = l.iter().map(|(n, _)| n.to_str().unwrap()).collect();
         assert_eq!(names, ["a.txt", "b.txt", "sub"]);
@@ -1144,7 +1298,7 @@ mod tests {
         // Between readdir and lstat an entry can be deleted (source in use:
         // lock/cache files). That must only be a warning.
         let (_tmp, s, _d) = setup();
-        let gone = read_entry(&s, "already_deleted.txt".into(), false)
+        let gone = read_entry(&s, "already_deleted.txt".into(), None)
             .expect("a vanished entry must not be an error");
         assert!(gone.is_none());
     }
@@ -1160,7 +1314,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
 
-        let l = read_listing(&s, Path::new(""), &Filter::default(), false).unwrap();
+        let l = read_listing(&s, Path::new(""), &Filter::default(), None).unwrap();
 
         let names: Vec<_> = l.iter().map(|(n, _)| n.to_str().unwrap()).collect();
         assert_eq!(names, ["normal.txt"], "FIFO must be skipped");
@@ -1442,7 +1596,7 @@ mod tests {
         ) -> Vec<SubDir<'a>> {
             Vec::new()
         }
-        fn collision(&self, rel: &Path, _why: &str) {
+        fn collision(&self, _: &Walker<'_>, rel: &Path, _why: &str) {
             self.0.lock().unwrap().push(rel.to_path_buf());
         }
     }
@@ -1471,12 +1625,11 @@ mod tests {
         let r = roots(&s, &d, &f);
         let w = Walker {
             roots: &r,
-            warn: false,
             unreadable: AtomicU64::new(0),
-            progress: None,
+            observer: None,
         };
         let src: Listing = vec![("Foo".into(), file_entry()), ("foo".into(), file_entry())];
-        let dst = read_listing(&d, Path::new(""), &f, false).unwrap();
+        let dst = read_listing(&d, Path::new(""), &f, None).unwrap();
         let spy = CollisionSpy::default();
 
         let (src, dst, renames) = w.resolve_aliases(&spy, Path::new(""), src, dst);
@@ -1493,6 +1646,198 @@ mod tests {
             renames.is_empty(),
             "a collision is never resolved by renaming"
         );
+    }
+
+    // ---- cancellation -----------------------------------------------------
+
+    fn temp_files(d: &Path) -> Vec<PathBuf> {
+        fn rec(dir: &Path, out: &mut Vec<PathBuf>) {
+            for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = e.path();
+                if e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".dino-copy.tmp.")
+                {
+                    out.push(p.clone());
+                }
+                if p.is_dir() && !p.is_symlink() {
+                    rec(&p, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        rec(d, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_run_cancelled_up_front_changes_nothing() {
+        let (_tmp, s, d) = setup();
+        fs::write(s.join("new.txt"), b"x").unwrap();
+        fs::write(d.join("stale.txt"), b"x").unwrap();
+        let p = plan_of(&s, &d);
+        let cancel = AtomicBool::new(true);
+        let f = Filter::default();
+        let r = Roots {
+            cancel: Some(&cancel),
+            ..roots(&s, &d, &f)
+        };
+        let errors = Mutex::new(Vec::new());
+        let opts = ExecOptions {
+            delete_budget: p.stats.remove_count,
+            ..opts(2)
+        };
+
+        let report = execute(&r, &p, opts, &NullSink, &errors);
+
+        assert!(report.cancelled);
+        assert_eq!(report.failed, 0, "a cancel is not a failure: {errors:?}");
+        assert!(!d.join("new.txt").exists());
+        assert!(
+            d.join("stale.txt").exists(),
+            "a cancelled run deletes nothing"
+        );
+    }
+
+    /// Sink that raises the cancel flag on the first chunk of copied data.
+    struct CancelOnFirstBytes<'a>(&'a AtomicBool);
+    impl ProgressSink for CancelOnFirstBytes<'_> {
+        fn add_bytes(&self, _n: u64) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+        fn set_current(&self, _worker: usize, _name: &str) {}
+        fn set_done(&self, _worker: usize) {}
+        fn inc_files(&self) {}
+    }
+
+    #[test]
+    fn a_cancel_interrupts_a_large_copy_and_leaves_no_temp_file() {
+        let (_tmp, s, d) = setup();
+        // Above the chunked-copy threshold, so the copy checks between chunks.
+        fs::write(s.join("big.bin"), vec![7u8; 24 * 1024 * 1024]).unwrap();
+        fs::write(d.join("stale.txt"), b"x").unwrap();
+        let p = plan_of(&s, &d);
+        let cancel = AtomicBool::new(false);
+        let f = Filter::default();
+        let r = Roots {
+            cancel: Some(&cancel),
+            ..roots(&s, &d, &f)
+        };
+        let errors = Mutex::new(Vec::new());
+        let opts = ExecOptions {
+            delete_budget: p.stats.remove_count,
+            ..opts(1)
+        };
+
+        let report = execute(&r, &p, opts, &CancelOnFirstBytes(&cancel), &errors);
+
+        assert!(report.cancelled);
+        assert_eq!(report.failed, 0, "{errors:?}");
+        assert!(
+            !d.join("big.bin").exists(),
+            "no half-written file under its real name"
+        );
+        assert!(
+            temp_files(&d).is_empty(),
+            "temp files left: {:?}",
+            temp_files(&d)
+        );
+        assert!(d.join("stale.txt").exists());
+        assert_eq!(
+            report.skip_reason,
+            Some(SkipReason::Cancelled),
+            "the removal found before the cancel is withheld"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_plan_says_so() {
+        let (_tmp, s, d) = setup();
+        fs::write(s.join("a"), b"x").unwrap();
+        let cancel = AtomicBool::new(true);
+        let f = Filter::default();
+        let r = Roots {
+            cancel: Some(&cancel),
+            ..roots(&s, &d, &f)
+        };
+        let opts = PlanOptions {
+            scan_jobs: 1,
+            checksum: false,
+            hash_jobs: 1,
+            details: false,
+        };
+
+        let p = plan(&r, opts, None);
+
+        assert!(p.cancelled);
+        assert_eq!(p.stats, Stats::default(), "nothing was walked");
+    }
+
+    // ---- scan details -----------------------------------------------------
+
+    #[test]
+    fn details_list_every_planned_change_with_its_path() {
+        let (_tmp, s, d) = setup();
+        fs::create_dir_all(s.join("new/deep")).unwrap();
+        fs::write(s.join("new/deep/f.txt"), b"12345").unwrap();
+        fs::write(s.join("x"), b"now a file").unwrap();
+        fs::create_dir_all(d.join("x/inner")).unwrap();
+        fs::create_dir_all(d.join("old/sub")).unwrap();
+        fs::write(d.join("old/sub/g"), b"g").unwrap();
+        let f = Filter::default();
+        let opts = PlanOptions {
+            scan_jobs: 2,
+            checksum: false,
+            hash_jobs: 2,
+            details: true,
+        };
+
+        let mut p = plan(&roots(&s, &d, &f), opts, None);
+        p.details.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let got: Vec<(&str, &DetailKind)> = p
+            .details
+            .iter()
+            .map(|d| (d.path.to_str().unwrap(), &d.kind))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("new", &DetailKind::Mkdir),
+                ("new/deep", &DetailKind::Mkdir),
+                ("new/deep/f.txt", &DetailKind::Copy { size: 5 }),
+                (
+                    "old",
+                    &DetailKind::Remove {
+                        is_dir: true,
+                        entries: 3
+                    }
+                ),
+                ("x", &DetailKind::Replace),
+                ("x", &DetailKind::Copy { size: 10 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn details_are_off_unless_asked_for() {
+        let (_tmp, s, d) = setup();
+        fs::write(s.join("a"), b"x").unwrap();
+
+        assert!(plan_of(&s, &d).details.is_empty());
+    }
+
+    #[test]
+    fn deletions_are_withheld_after_an_incomplete_plan() {
+        let (_tmp, s, d) = setup();
+        let mut p = plan_of(&s, &d);
+        assert!(p.deletions_allowed(false));
+        p.unreadable = 1;
+        assert!(!p.deletions_allowed(false));
+        assert!(p.deletions_allowed(true), "--ignore-errors overrides");
+        p.unreadable = 0;
+        p.collisions = 1;
+        assert!(!p.deletions_allowed(false));
     }
 
     /// Sink that records the (worker, name) pairs passed to set_current and

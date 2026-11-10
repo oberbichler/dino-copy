@@ -11,7 +11,9 @@
 #![forbid(unsafe_code)]
 
 #[cfg(not(unix))]
-compile_error!("dino-copy only supports Unix systems (macOS, Linux): it requires Unix permissions and symlinks.");
+compile_error!(
+    "dino-copy only supports Unix systems (macOS, Linux): it requires Unix permissions and symlinks."
+);
 
 pub mod filter;
 pub mod guard;

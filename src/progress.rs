@@ -121,7 +121,7 @@ impl ScanProgressBars {
     }
 }
 
-impl dino_copy_core::walk::ScanProgress for ScanProgressBars {
+impl dino_copy_core::walk::PlanObserver for ScanProgressBars {
     fn listed(&self, n: u64) {
         self.entries.inc(n);
     }
@@ -129,6 +129,9 @@ impl dino_copy_core::walk::ScanProgress for ScanProgressBars {
         if let Some(bar) = &self.hashed {
             bar.inc(1);
         }
+    }
+    fn warning(&self, msg: &str) {
+        eprintln!("Warning: {msg}");
     }
 }
 

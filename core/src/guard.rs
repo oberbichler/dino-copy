@@ -27,9 +27,7 @@ pub fn resolve_existing(path: &std::path::Path) -> Result<PathBuf> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let name = cur
                     .file_name()
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Cannot resolve path: {}", path.display())
-                    })?
+                    .ok_or_else(|| anyhow::anyhow!("Cannot resolve path: {}", path.display()))?
                     .to_os_string();
                 tail.push(name);
                 cur.pop();
@@ -40,8 +38,7 @@ pub fn resolve_existing(path: &std::path::Path) -> Result<PathBuf> {
                 }
             }
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("Cannot resolve path: {}", path.display()))
+                return Err(e).with_context(|| format!("Cannot resolve path: {}", path.display()));
             }
         }
     }
@@ -85,7 +82,10 @@ mod tests {
         let dir = tmp.path().join("there");
         std::fs::create_dir(&dir).unwrap();
 
-        assert_eq!(resolve_existing(&dir).unwrap(), std::fs::canonicalize(&dir).unwrap());
+        assert_eq!(
+            resolve_existing(&dir).unwrap(),
+            std::fs::canonicalize(&dir).unwrap()
+        );
     }
 
     #[test]
@@ -115,7 +115,10 @@ mod tests {
         // again.
         let got = resolve_existing(Path::new("doesnotexistxyz")).unwrap();
 
-        assert_eq!(got, std::fs::canonicalize(".").unwrap().join("doesnotexistxyz"));
+        assert_eq!(
+            got,
+            std::fs::canonicalize(".").unwrap().join("doesnotexistxyz")
+        );
     }
 
     #[test]
@@ -133,4 +136,3 @@ mod tests {
         assert_eq!(got, std::fs::canonicalize(&real).unwrap().join("missing"));
     }
 }
-
