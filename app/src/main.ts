@@ -28,6 +28,8 @@ interface Choice {
   path: string;
   name: string;
   kind: "volume" | "folder";
+  /** Free space, as seen when the disk was picked. */
+  detail?: string;
 }
 
 interface Progress {
@@ -59,8 +61,8 @@ interface RunResult {
   items?: ScanItem[];
 }
 
-const SMALL = new LogicalSize(480, 250);
-const LARGE = new LogicalSize(860, 640);
+const SMALL = new LogicalSize(520, 300);
+const LARGE = new LogicalSize(880, 660);
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const win = getCurrentWindow();
@@ -86,7 +88,7 @@ function show(view: "setup" | "running" | "done" | "scan"): void {
 
 async function useLargeWindow(large: boolean): Promise<void> {
   await win.setResizable(large);
-  await win.setMinSize(large ? new LogicalSize(640, 420) : null);
+  await win.setMinSize(large ? new LogicalSize(680, 460) : null);
   await win.setSize(large ? LARGE : SMALL);
   await win.center();
 }
@@ -98,9 +100,12 @@ async function useLargeWindow(large: boolean): Promise<void> {
 function renderPicker(side: Side): void {
   const choice = state[side];
   const el = $(`pick-${side}`);
-  el.querySelector(".picker-name")!.textContent = choice?.name ?? `Choose ${side}…`;
-  setPath(el.querySelector(".picker-sub")!, choice?.path ?? "");
-  el.querySelector(".picker-icon")!.className = `picker-icon ${choice?.kind ?? "none"}`;
+  el.querySelector(".tile-name")!.textContent = choice?.name ?? "Choose…";
+  const detail = el.querySelector(".tile-detail")!;
+  detail.classList.toggle("path", choice?.kind === "folder");
+  if (choice?.kind === "folder") setPath(detail, choice.path);
+  else detail.textContent = choice ? (choice.detail ?? choice.path) : "a disk or a folder";
+  el.querySelector(".disk-icon")!.className = `disk-icon ${choice?.kind ?? "none"}`;
   el.classList.toggle("empty", !choice);
 }
 
@@ -113,10 +118,11 @@ async function openPicker(side: Side): Promise<void> {
   const items: MenuItems = [];
   for (const v of volumes) {
     const used = v.totalBytes - v.availableBytes;
+    const free = `${fmt.bytes(v.availableBytes)} free of ${fmt.bytes(v.totalBytes)}`;
     items.push({
-      text: `${v.name}  —  ${fmt.bytes(used)} of ${fmt.bytes(v.totalBytes)} used`,
+      text: `${v.name}  ·  ${fmt.bytes(used)} used`,
       checked: current?.path === v.path,
-      action: () => choose(side, { path: v.path, name: v.name, kind: "volume" }),
+      action: () => choose(side, { path: v.path, name: v.name, kind: "volume", detail: free }),
     });
   }
   if (volumes.length === 0) items.push({ text: "No external disks found", enabled: false });
@@ -128,7 +134,7 @@ async function openPicker(side: Side): Promise<void> {
   items.push({ text: "Choose Folder…", action: () => void chooseFolder(side) });
   const menu = await Menu.new({ items });
   const rect = el.getBoundingClientRect();
-  await menu.popup(new LogicalPosition(rect.left, rect.bottom + 4));
+  await menu.popup(new LogicalPosition(rect.left + 8, rect.bottom - 8));
   el.classList.remove("active");
 }
 
@@ -148,10 +154,9 @@ function choose(side: Side, choice: Choice): void {
 /** Enables Start only for a pair the backend accepts, and says why not. */
 async function validate(): Promise<void> {
   const hint = $("setup-hint");
-  const start = $<HTMLButtonElement>("start");
   if (!state.source || !state.target) {
     hint.textContent = "Choose a source and a target.";
-    start.disabled = true;
+    setStartEnabled(false);
     return;
   }
   const problem = await invoke<string | null>("check_pair", {
@@ -160,7 +165,16 @@ async function validate(): Promise<void> {
   });
   hint.textContent = problem ?? (state.mode === "mirror" ? "The target will become an exact copy of the source." : "Shows what a mirror would do. Nothing is changed.");
   hint.classList.toggle("problem", problem !== null);
-  start.disabled = problem !== null;
+  setStartEnabled(problem === null);
+}
+
+/**
+ * A disabled Start turns the whole split button neutral (as macOS does with a
+ * disabled default button); the arrow stays usable to switch the mode.
+ */
+function setStartEnabled(on: boolean): void {
+  $<HTMLButtonElement>("start").disabled = !on;
+  document.querySelector(".split-button")!.classList.toggle("off", !on);
 }
 
 function renderMode(): void {
@@ -194,10 +208,10 @@ async function start(mode: Mode): Promise<void> {
     // Asked once; the run does not depend on the answer.
     void requestPermission();
   }
-  $("run-route").textContent = `${state.source.name} → ${state.target.name} · ${mode === "mirror" ? "Mirror" : "Scan"}`;
+  setCaption($("run-caption"), mode === "mirror" ? "Mirroring" : "Scanning");
   onPhase("scanning");
-  $("run-eta").innerHTML = "&nbsp;";
-  for (const id of ["run-bytes", "run-rate", "run-files", "run-current"]) $(id).textContent = "";
+  for (const id of ["run-bytes", "run-rate", "run-files"]) $(id).textContent = "–";
+  $("run-current").textContent = "";
   try {
     await invoke("start", { mode, source: state.source.path, target: state.target.path });
   } catch (e) {
@@ -214,17 +228,20 @@ function onPhase(phase: Phase): void {
   const cancel = $<HTMLButtonElement>("cancel");
   const bar = $("run-bar");
   if (phase === "scanning") {
-    $("run-phase").textContent = "Comparing source and target…";
+    $("run-eta").textContent = "Comparing…";
+    $("run-phase").textContent = "Looking for what changed since the last mirror";
     bar.classList.add("indeterminate");
     cancel.disabled = false;
     cancel.textContent = "Cancel";
   } else if (phase === "copying") {
     state.copyStartedAt = performance.now();
-    $("run-phase").textContent = "Mirroring";
+    $("run-eta").textContent = "Estimating time left…";
+    $("run-phase").textContent = "Copying new and changed files";
     bar.classList.remove("indeterminate");
     bar.style.width = "0%";
   } else {
-    $("run-phase").textContent = "Removing what is no longer in the source…";
+    $("run-eta").textContent = "Almost done";
+    $("run-phase").textContent = "Removing what is no longer in the source";
     bar.classList.add("indeterminate");
     // Half-done removals would be worse than finished ones.
     cancel.disabled = true;
@@ -233,7 +250,7 @@ function onPhase(phase: Phase): void {
 }
 
 function onScanProgress(entries: number): void {
-  $("run-files").textContent = `${fmt.count(entries)} entries compared`;
+  $("run-files").textContent = `${fmt.count(entries)} compared`;
 }
 
 function onProgress(p: Progress): void {
@@ -249,23 +266,14 @@ function onProgress(p: Progress): void {
   $("run-bar").style.width = `${Math.min(100, fraction * 100).toFixed(1)}%`;
   $("run-eta").textContent = p.etaSecs === null ? "Estimating time left…" : fmt.timeLeft(p.etaSecs);
   $("run-bytes").textContent = `${fmt.bytes(p.bytesDone)} of ${fmt.bytes(p.bytesTotal)}`;
-  $("run-rate").textContent = p.bytesPerSec > 0 ? `${fmt.bytes(p.bytesPerSec)}/s` : "";
-  $("run-files").textContent = `${fmt.count(p.filesDone)} of ${fmt.plural(p.filesTotal, "file")}`;
+  $("run-rate").textContent = p.bytesPerSec > 0 ? `${fmt.bytes(p.bytesPerSec)}/s` : "–";
+  $("run-files").textContent = `${fmt.count(p.filesDone)} of ${fmt.count(p.filesTotal)}`;
   setPath($("run-current"), p.current);
 }
 
 // ---------------------------------------------------------------------------
 // 3 · Done, 4 · Scan
 // ---------------------------------------------------------------------------
-
-const ICONS: Record<RunResult["outcome"], string> = {
-  success: "✓",
-  inSync: "✓",
-  scanned: "✓",
-  incomplete: "!",
-  failed: "✕",
-  cancelled: "–",
-};
 
 async function onDone(r: RunResult): Promise<void> {
   state.running = false;
@@ -278,9 +286,7 @@ async function onDone(r: RunResult): Promise<void> {
     await showScan(r);
     return;
   }
-  const icon = $("done-icon");
-  icon.textContent = ICONS[r.outcome];
-  icon.className = `done-icon ${r.outcome}`;
+  $("done-icon").className = `done-icon ${r.outcome}`;
   $("done-headline").textContent = r.headline;
   $("done-summary").textContent = summaryText(r);
   $("done-messages").innerHTML = "";
@@ -306,7 +312,7 @@ const scanView = new ScanView($("scan-rows"), $("scan-spacer"), $("scan-shown"))
 
 async function showScan(r: RunResult): Promise<void> {
   const s = r.summary;
-  $("scan-route").textContent = `${state.source?.name} → ${state.target?.name} · Scan`;
+  setCaption($("scan-caption"), "Scan");
   $("scan-summary").textContent =
     s.copyCount + s.deleteCount + s.renameCount === 0
       ? "Nothing to do: the target already mirrors the source."
@@ -326,6 +332,14 @@ async function showScan(r: RunResult): Promise<void> {
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
+
+/** "MIRRORING  Fotos-A → Fotos-B": a small label, then the route in plain text. */
+function setCaption(el: HTMLElement, label: string): void {
+  const route = document.createElement("span");
+  route.className = "caption-route";
+  route.textContent = `${state.source?.name ?? ""} → ${state.target?.name ?? ""}`;
+  el.replaceChildren(label, route);
+}
 
 /**
  * Shows a path that, when too long, is cut at the start ("…/2024/IMG_1.CR3").

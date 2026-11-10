@@ -231,7 +231,7 @@ function flatten(node: Node, out: Row[], isOpen: (n: Node) => boolean): void {
       open,
       label: child.name,
       sign: child.items.some((i) => i.k === "m") ? "copy" : undefined,
-      detail: [tags, countsText(child.counts)].filter(Boolean).join(" · "),
+      detail: [tags, countsText(child.counts)].filter(Boolean).join(""),
       title: child.path,
     });
     if (open) flatten(child, out, isOpen);
@@ -247,10 +247,10 @@ function folderTag(it: ScanItem): string {
 
 function countsText(c: Counts): string {
   const parts: string[] = [];
-  if (c.copy) parts.push(`<span class="sign copy">＋${fmt.count(c.copy)}</span>`);
-  if (c.delete) parts.push(`<span class="sign delete">−${fmt.count(c.delete)}</span>`);
-  if (c.rename) parts.push(`<span class="sign rename">↻${fmt.count(c.rename)}</span>`);
-  return parts.join(" ");
+  if (c.copy) parts.push(`<span class="n copy">+${fmt.count(c.copy)}</span>`);
+  if (c.delete) parts.push(`<span class="n delete">−${fmt.count(c.delete)}</span>`);
+  if (c.rename) parts.push(`<span class="n rename">↻${fmt.count(c.rename)}</span>`);
+  return parts.join("");
 }
 
 function itemRow(it: ScanItem, label: string, depth: number): Row {
@@ -274,16 +274,16 @@ function itemRow(it: ScanItem, label: string, depth: number): Row {
   }
 }
 
-const SIGN: Record<Category, string> = { copy: "＋", delete: "−", rename: "↻" };
+const SIGN: Record<Category, string> = { copy: "+", delete: "−", rename: "↻" };
 
 function renderRow(r: Row, index: number): string {
   const indent = 10 + r.depth * 16;
-  const disclosure = r.folder ? `<span class="disclosure">${r.open ? "▾" : "▸"}</span>` : `<span class="disclosure"></span>`;
+  const disclosure = `<span class="disclosure"></span>`;
   const sign = r.sign ? `<span class="sign ${r.sign}">${SIGN[r.sign]}</span>` : "";
   const icon = r.folder ? `<span class="folder-icon"></span>` : "";
   const attrs = r.folder ? ` data-folder="${escapeAttr(r.folder.path)}"` : "";
   return (
-    `<div class="row${r.folder ? " folder" : ""} ${r.sign ?? ""}"${attrs} style="top:${index * ROW_HEIGHT}px;padding-left:${indent}px" title="${escapeAttr(r.title)}">` +
+    `<div class="row${r.folder ? " folder" : ""}${r.open ? " open" : ""} ${r.sign ?? ""}"${attrs} style="top:${index * ROW_HEIGHT}px;padding-left:${indent}px" title="${escapeAttr(r.title)}">` +
     `${disclosure}${sign}${icon}<span class="row-label">${escapeHtml(r.label)}</span>` +
     `<span class="row-detail">${r.detail}</span></div>`
   );

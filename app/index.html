@@ -10,36 +10,33 @@
   </head>
 
   <body>
+    <!-- The title bar is transparent; this strip lets the window be dragged. -->
+    <div class="titlebar" data-tauri-drag-region></div>
+
     <!-- 1 · Choose source and target, then Start -->
     <section id="setup" class="view">
-      <div class="pair">
-        <label class="pair-label" for="pick-source">Source</label>
-        <button id="pick-source" class="picker" type="button">
-          <span class="picker-icon" aria-hidden="true"></span>
-          <span class="picker-text">
-            <span class="picker-name">Choose source…</span>
-            <span class="picker-sub"></span>
-          </span>
-          <span class="picker-chevron" aria-hidden="true">⌄</span>
+      <div class="route-tiles">
+        <button id="pick-source" class="tile" type="button">
+          <span class="tile-caption">Source <span class="chevron" aria-hidden="true"></span></span>
+          <span class="disk-icon" aria-hidden="true"></span>
+          <span class="tile-name"></span>
+          <span class="tile-detail"></span>
         </button>
-
-        <label class="pair-label" for="pick-target">Target</label>
-        <button id="pick-target" class="picker" type="button">
-          <span class="picker-icon" aria-hidden="true"></span>
-          <span class="picker-text">
-            <span class="picker-name">Choose target…</span>
-            <span class="picker-sub"></span>
-          </span>
-          <span class="picker-chevron" aria-hidden="true">⌄</span>
+        <span class="route-arrow" aria-hidden="true"></span>
+        <button id="pick-target" class="tile" type="button">
+          <span class="tile-caption">Target <span class="chevron" aria-hidden="true"></span></span>
+          <span class="disk-icon" aria-hidden="true"></span>
+          <span class="tile-name"></span>
+          <span class="tile-detail"></span>
         </button>
       </div>
 
-      <footer class="setup-footer">
+      <footer class="footer">
         <p id="setup-hint" class="hint"></p>
         <div class="split-button">
           <button id="start" class="primary split-main" type="button" disabled>Mirror</button>
           <button id="start-menu" class="primary split-arrow" type="button" aria-label="Choose what Start does">
-            <span aria-hidden="true">⌄</span>
+            <span class="chevron" aria-hidden="true"></span>
           </button>
         </div>
       </footer>
@@ -47,34 +44,34 @@
 
     <!-- 2 · Running: progress and time left -->
     <section id="running" class="view" hidden>
-      <p id="run-route" class="route"></p>
-      <p id="run-phase" class="phase">Comparing source and target…</p>
+      <p id="run-caption" class="caption"></p>
       <p id="run-eta" class="eta">&nbsp;</p>
+      <p id="run-phase" class="phase"></p>
       <div class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100">
         <div id="run-bar" class="bar-fill indeterminate"></div>
       </div>
-      <div class="run-stats">
-        <span id="run-bytes"></span>
-        <span id="run-rate"></span>
+      <div class="stats">
+        <div class="stat"><span class="stat-label">Copied</span><span id="run-bytes" class="stat-value">–</span></div>
+        <div class="stat"><span class="stat-label">Files</span><span id="run-files" class="stat-value">–</span></div>
+        <div class="stat"><span class="stat-label">Speed</span><span id="run-rate" class="stat-value">–</span></div>
       </div>
-      <p id="run-files" class="muted"></p>
-      <p id="run-current" class="current muted"></p>
-      <footer class="run-footer">
+      <p id="run-current" class="current"></p>
+      <footer class="footer">
+        <span class="hint"></span>
         <button id="cancel" type="button">Cancel</button>
       </footer>
     </section>
 
     <!-- 3 · Finished -->
     <section id="done" class="view" hidden>
-      <div class="done-head">
+      <div class="done-body">
         <span id="done-icon" class="done-icon" aria-hidden="true"></span>
-        <div>
-          <p id="done-headline" class="headline"></p>
-          <p id="done-summary" class="muted"></p>
-        </div>
+        <p id="done-headline" class="headline"></p>
+        <p id="done-summary" class="secondary"></p>
+        <ul id="done-messages" class="messages"></ul>
       </div>
-      <ul id="done-messages" class="messages"></ul>
-      <footer class="done-footer">
+      <footer class="footer">
+        <span class="hint"></span>
         <button id="done-ok" class="primary" type="button">Done</button>
       </footer>
     </section>
@@ -82,17 +79,17 @@
     <!-- 4 · Scan result -->
     <section id="scan" class="view" hidden>
       <header class="scan-head">
-        <p id="scan-route" class="route"></p>
+        <p id="scan-caption" class="caption"></p>
         <p id="scan-summary" class="headline"></p>
-        <p id="scan-note" class="muted"></p>
+        <p id="scan-note" class="secondary"></p>
       </header>
-      <div class="scan-tools">
+      <div class="toolbar">
         <div class="chips" role="group" aria-label="Show">
-          <button class="chip on" data-cat="copy" type="button"><span class="sign copy">＋</span> Copy <b id="count-copy">0</b></button>
-          <button class="chip on" data-cat="delete" type="button"><span class="sign delete">−</span> Delete <b id="count-delete">0</b></button>
-          <button class="chip on" data-cat="rename" type="button"><span class="sign rename">↻</span> Rename <b id="count-rename">0</b></button>
+          <button class="chip on" data-cat="copy" type="button"><span class="dot copy"></span>Copy <b id="count-copy">0</b></button>
+          <button class="chip on" data-cat="delete" type="button"><span class="dot delete"></span>Delete <b id="count-delete">0</b></button>
+          <button class="chip on" data-cat="rename" type="button"><span class="dot rename"></span>Rename <b id="count-rename">0</b></button>
         </div>
-        <input id="scan-search" class="search" type="search" placeholder="Search name or path" spellcheck="false" autocomplete="off" />
+        <input id="scan-search" class="search" type="search" placeholder="Search" spellcheck="false" autocomplete="off" />
         <div class="segmented" role="group" aria-label="View">
           <button id="view-tree" class="on" type="button">Tree</button>
           <button id="view-list" type="button">List</button>
@@ -101,11 +98,10 @@
       <div id="scan-rows" class="rows" tabindex="0">
         <div id="scan-spacer" class="rows-spacer"></div>
       </div>
-      <footer class="scan-footer">
-        <span id="scan-shown" class="muted"></span>
-        <span class="spacer"></span>
+      <footer class="footer">
+        <span id="scan-shown" class="hint"></span>
         <button id="scan-close" type="button">Close</button>
-        <button id="scan-mirror" class="primary" type="button">Mirror now</button>
+        <button id="scan-mirror" class="primary" type="button">Mirror Now</button>
       </footer>
     </section>
   </body>

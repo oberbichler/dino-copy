@@ -21,12 +21,12 @@ export function count(n: number): string {
 
 /** Remaining time, rounded the way people say it. */
 export function timeLeft(secs: number): string {
-  if (secs < 45) return "less than a minute left";
+  if (secs < 45) return "Less than a minute left";
   const mins = Math.round(secs / 60);
-  if (mins < 60) return `about ${mins} min left`;
+  if (mins < 60) return `About ${mins} ${mins === 1 ? "minute" : "minutes"} left`;
   const h = Math.floor(mins / 60);
   const m = mins % 60;
-  return m === 0 ? `about ${h} h left` : `about ${h} h ${m} min left`;
+  return m === 0 ? `About ${h} h left` : `About ${h} h ${m} min left`;
 }
 
 /** Elapsed time: "42 s", "3 min 5 s", "1 h 12 min". */

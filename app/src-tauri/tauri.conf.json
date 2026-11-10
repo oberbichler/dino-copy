@@ -15,11 +15,13 @@
       {
         "label": "main",
         "title": "dino-copy",
-        "width": 480,
-        "height": 250,
+        "width": 520,
+        "height": 300,
         "resizable": false,
         "maximizable": false,
-        "center": true
+        "center": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {
