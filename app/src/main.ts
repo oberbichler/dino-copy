@@ -50,6 +50,8 @@ interface Progress {
   current: string;
   bytesPerSec: number;
   etaSecs: number | null;
+  /** Done work over all work (bytes, plus a share per file), 0 to 1. */
+  fraction: number;
 }
 
 interface Summary {
@@ -130,8 +132,6 @@ const state = {
   mode: (localStorage.getItem("mode") === "scan" ? "scan" : "mirror") as Mode,
   running: false,
   closeWhenDone: false,
-  /** When copying began: the time estimate and the bar measure from here. */
-  copyStartedAt: 0,
   lastResult: null as RunResult | null,
 };
 
@@ -309,7 +309,6 @@ function onPhase(phase: Phase): void {
     cancel.disabled = false;
     cancel.textContent = t("cancel");
   } else if (phase === "copying") {
-    state.copyStartedAt = performance.now();
     $("run-eta").textContent = t("estimating");
     $("run-phase").textContent = t("phaseCopying");
     bar.classList.remove("indeterminate");
@@ -329,16 +328,8 @@ function onScanProgress(entries: number): void {
 }
 
 function onProgress(p: Progress): void {
-  const elapsed = (performance.now() - state.copyStartedAt) / 1000;
-  // Progress by time, consistent with the estimate (bytes alone mislead when
-  // many tiny files remain).
-  const fraction =
-    p.etaSecs !== null && elapsed + p.etaSecs > 0
-      ? elapsed / (elapsed + p.etaSecs)
-      : p.bytesTotal > 0
-        ? p.bytesDone / p.bytesTotal
-        : p.filesDone / Math.max(1, p.filesTotal);
-  $("run-bar").style.width = `${Math.min(100, fraction * 100).toFixed(1)}%`;
+  // The backend measures the work so that the bar and the estimate agree.
+  $("run-bar").style.width = `${Math.min(100, p.fraction * 100).toFixed(1)}%`;
   $("run-eta").textContent = p.etaSecs === null ? t("estimating") : fmt.timeLeft(p.etaSecs);
   $("run-bytes").textContent = t("xOfY", { done: fmt.bytes(p.bytesDone), total: fmt.bytes(p.bytesTotal) });
   $("run-rate").textContent = p.bytesPerSec > 0 ? `${fmt.bytes(p.bytesPerSec)}/s` : "–";

@@ -155,8 +155,10 @@ for (const lang of Object.keys(LANGUAGES) as Lang[]) {
       await emit(page, "run://progress", {
         bytesDone: 1.2e12, bytesTotal: 3.9e12, filesDone: 123456, filesTotal: 987654,
         current: "Fotos/2024/Urlaub mit einem sehr langen Ordnernamen/noch ein Unterordner/IMG_4711.CR3",
-        bytesPerSec: 1.1e9, etaSecs: 3 * 3600 + 25 * 60,
+        bytesPerSec: 1.1e9, etaSecs: 3 * 3600 + 25 * 60, fraction: 0.31,
       });
+      // The bar shows the backend's share of done work.
+      expect(await page.locator("#run-bar").evaluate((el) => el.style.width)).toBe("31%");
       await expect(page.locator("#run-current")).toBeVisible();
       await tidy(page, "09-copying");
 

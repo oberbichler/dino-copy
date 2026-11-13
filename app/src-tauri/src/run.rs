@@ -13,7 +13,7 @@ use dino_copy_core::walk::{
     self, DetailKind, ExecOptions, Plan, PlanObserver, PlanOptions, Roots, SkipReason,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -89,6 +89,8 @@ struct Progress {
     bytes_per_sec: f64,
     /// Estimated seconds left; `None` until the rate is known.
     eta_secs: Option<f64>,
+    /// Done work over all work (see [`Estimator`]), for the bar.
+    fraction: f64,
 }
 
 #[derive(Clone, Serialize)]
@@ -696,10 +698,8 @@ impl<'a, R: Runtime> Sink<'a, R> {
         }
     }
 
-    /// Sends progress every [`TICK`] until the run is done. The rate is
-    /// smoothed; the estimate takes whichever is slower to finish — the
-    /// remaining bytes or the remaining files — so that many tiny files do
-    /// not make it look almost done.
+    /// Sends progress every [`TICK`] until the run is done (see
+    /// [`Estimator`]).
     fn tick_until_done(&self, errors: &Mutex<Vec<Problem>>) {
         let mut est = Estimator::default();
         let mut seen = 0;
@@ -721,6 +721,7 @@ impl<'a, R: Runtime> Sink<'a, R> {
                 let _ = self.app.emit("run://issues", kinds);
             }
             let p = est.update(
+                Instant::now(),
                 self.bytes.load(Ordering::Relaxed),
                 self.bytes_total,
                 self.files.load(Ordering::Relaxed),
@@ -748,60 +749,75 @@ impl<R: Runtime> ProgressSink for Sink<'_, R> {
     }
 }
 
-/// Smoothed transfer rates and the remaining time.
+/// Transfer rates and the remaining time, measured over the last
+/// [`Estimator::WINDOW`].
+///
+/// The remaining work counts every byte plus [`Estimator::PER_FILE`] for every
+/// file, so that many tiny files are not "almost done" when their few bytes
+/// are, while a large file moves the bar as its bytes go. Measured over a
+/// window rather than tick by tick, neither the system's write cache (data
+/// arrives in bursts) nor large files (one completes every now and then) throw
+/// the speed, the estimate or the bar around; and the bar, being done work
+/// over all work, never moves back.
 #[derive(Default)]
 struct Estimator {
-    last: Option<(Instant, u64, u64)>,
-    byte_rate: Option<f64>,
-    file_rate: Option<f64>,
+    /// (time, bytes, work) per tick, oldest first, spanning the window.
+    samples: VecDeque<(Instant, u64, u64)>,
 }
 
 impl Estimator {
-    /// Weight of the newest sample in the moving average.
-    const ALPHA: f64 = 0.15;
+    /// How far back the rates look.
+    const WINDOW: Duration = Duration::from_secs(20);
+    /// How much has to be seen before there is a rate at all.
+    const MIN_SPAN: Duration = Duration::from_secs(3);
+    /// The work of one file besides its bytes (opening, creating, metadata),
+    /// in bytes: roughly what an external disk transfers in that time.
+    const PER_FILE: u64 = 512 * 1024;
 
     fn update(
         &mut self,
+        now: Instant,
         bytes: u64,
         bytes_total: u64,
         files: u64,
         files_total: u64,
         current: String,
     ) -> Progress {
-        let now = Instant::now();
-        if let Some((t, b, f)) = self.last {
-            let dt = now.duration_since(t).as_secs_f64();
-            if dt > 0.0 {
-                let smooth = |old: Option<f64>, new: f64| {
-                    Some(old.map_or(new, |o| o + Self::ALPHA * (new - o)))
-                };
-                self.byte_rate = smooth(self.byte_rate, (bytes - b) as f64 / dt);
-                self.file_rate = smooth(self.file_rate, (files - f) as f64 / dt);
-            }
+        let work =
+            |bytes: u64, files: u64| bytes.saturating_add(files.saturating_mul(Self::PER_FILE));
+        let (done, total) = (work(bytes, files), work(bytes_total, files_total));
+
+        self.samples.push_back((now, bytes, done));
+        // Keep one sample at or beyond the window's start.
+        while self.samples.len() > 2 && now.duration_since(self.samples[1].0) >= Self::WINDOW {
+            self.samples.pop_front();
         }
-        self.last = Some((now, bytes, files));
+        let (t0, bytes0, done0) = self.samples[0];
+        let span = now.duration_since(t0);
+        let rate = |from: u64, to: u64| {
+            (span >= Self::MIN_SPAN).then(|| to.saturating_sub(from) as f64 / span.as_secs_f64())
+        };
+        let work_rate = rate(done0, done).filter(|r| *r > 0.0);
+        let left = total.saturating_sub(done);
+
         Progress {
             bytes_done: bytes,
             bytes_total,
             files_done: files,
             files_total,
             current,
-            bytes_per_sec: self.byte_rate.unwrap_or(0.0),
-            eta_secs: self.eta(bytes, bytes_total, files, files_total),
+            bytes_per_sec: rate(bytes0, bytes).unwrap_or(0.0),
+            eta_secs: if total > 0 && left == 0 {
+                Some(0.0)
+            } else {
+                work_rate.map(|r| left as f64 / r)
+            },
+            fraction: if total == 0 {
+                1.0
+            } else {
+                done as f64 / total as f64
+            },
         }
-    }
-
-    fn eta(&self, bytes: u64, bytes_total: u64, files: u64, files_total: u64) -> Option<f64> {
-        let left = |done: u64, total: u64, rate: Option<f64>| -> Option<f64> {
-            let rest = total.saturating_sub(done) as f64;
-            if rest == 0.0 {
-                return Some(0.0);
-            }
-            rate.filter(|r| *r > 0.0).map(|r| rest / r)
-        };
-        let by_bytes = left(bytes, bytes_total, self.byte_rate)?;
-        let by_files = left(files, files_total, self.file_rate)?;
-        Some(by_bytes.max(by_files))
     }
 }
 
@@ -855,16 +871,130 @@ mod tests {
         assert!(check_pair(&a, &b).is_ok());
     }
 
-    #[test]
-    fn the_estimate_waits_for_a_rate_and_follows_the_slower_side() {
+    /// Runs the estimator over a copy that moves `bytes_at(t)` bytes and
+    /// `files_at(t)` files by second `t`, ticking like the app, and returns
+    /// every report with its time.
+    fn simulate(
+        secs: f64,
+        bytes_total: u64,
+        files_total: u64,
+        bytes_at: impl Fn(f64) -> u64,
+        files_at: impl Fn(f64) -> u64,
+    ) -> Vec<(f64, Progress)> {
+        let start = Instant::now();
         let mut e = Estimator::default();
-        assert_eq!(e.update(0, 1000, 0, 10, String::new()).eta_secs, None);
-        e.byte_rate = Some(100.0);
-        e.file_rate = Some(1.0);
-        // 900 bytes at 100/s = 9 s, but 9 files at 1/s = 9 s; make files slower.
-        assert_eq!(e.eta(100, 1000, 1, 10), Some(9.0));
-        assert_eq!(e.eta(100, 1000, 0, 20), Some(20.0));
-        assert_eq!(e.eta(1000, 1000, 10, 10), Some(0.0));
+        let mut out = Vec::new();
+        let mut t = 0.0;
+        while t <= secs {
+            let now = start + Duration::from_secs_f64(t);
+            let p = e.update(
+                now,
+                bytes_at(t),
+                bytes_total,
+                files_at(t),
+                files_total,
+                String::new(),
+            );
+            out.push((t, p));
+            t += TICK.as_secs_f64();
+        }
+        out
+    }
+
+    #[test]
+    fn the_estimate_waits_until_the_rate_is_known() {
+        let r = simulate(1.0, 1000, 10, |t| (t * 100.0) as u64, |_| 0);
+        assert!(r.iter().all(|(_, p)| p.eta_secs.is_none()));
+        assert!(r.iter().all(|(_, p)| p.bytes_per_sec == 0.0));
+        let done = simulate(0.0, 0, 0, |_| 0, |_| 0);
+        assert_eq!(done[0].1.eta_secs, None);
+        assert_eq!(done[0].1.fraction, 1.0);
+    }
+
+    /// Four 2 GB videos at a steady 100 MB/s: a file completes only every
+    /// 20 s, which must not throw the estimate or the bar around.
+    #[test]
+    fn large_files_give_a_steady_estimate_and_bar() {
+        const GB: u64 = 1_000_000_000;
+        let rate = 100e6;
+        let total = 4 * 2 * GB;
+        let r = simulate(
+            79.0,
+            total,
+            4,
+            |t| (t * rate) as u64,
+            |t| (t * rate) as u64 / (2 * GB),
+        );
+        let mut last_fraction = 0.0;
+        for (t, p) in &r {
+            assert!(p.fraction >= last_fraction, "bar went back at {t} s");
+            last_fraction = p.fraction;
+            if let Some(eta) = p.eta_secs {
+                let actual = total as f64 / rate - t;
+                assert!(
+                    (eta - actual).abs() <= 0.1 * actual + 3.0,
+                    "at {t} s: {eta} s left, actually {actual} s"
+                );
+            } else {
+                assert!(*t < 5.0, "no estimate at {t} s");
+            }
+        }
+    }
+
+    /// 100,000 files of 4 KB at 500 files/s: the files, not the few bytes,
+    /// decide how long the copy takes.
+    #[test]
+    fn many_tiny_files_are_not_almost_done_when_the_bytes_are() {
+        let files = 100_000;
+        let r = simulate(
+            60.0,
+            files * 4096,
+            files,
+            |t| (t * 500.0) as u64 * 4096,
+            |t| (t * 500.0) as u64,
+        );
+        let (t, p) = r.last().unwrap();
+        let actual = files as f64 / 500.0 - t;
+        let eta = p.eta_secs.unwrap();
+        assert!(
+            (eta - actual).abs() <= 0.1 * actual,
+            "{eta} s left, actually {actual} s"
+        );
+        assert!(
+            (p.fraction - t / (files as f64 / 500.0)).abs() < 0.05,
+            "bar at {}",
+            p.fraction
+        );
+    }
+
+    /// The disk takes data in bursts (the system's write cache): 400 MB/s for
+    /// one second, nothing the next. Speed and estimate show the average.
+    #[test]
+    fn bursts_are_averaged_out() {
+        let total = 100_000_000_000;
+        let bytes_at = |t: f64| {
+            let whole = t.floor();
+            let in_burst = if (whole as u64).is_multiple_of(2) {
+                t - whole
+            } else {
+                1.0
+            };
+            ((whole / 2.0).floor() * 400e6 + in_burst.min(1.0) * 400e6) as u64
+        };
+        let r = simulate(120.0, total, 10_000, bytes_at, |t| bytes_at(t) / 10_000_000);
+        for (t, p) in r.iter().filter(|(t, _)| *t >= 30.0) {
+            assert!(
+                (p.bytes_per_sec - 200e6).abs() < 0.15 * 200e6,
+                "at {t} s: {} B/s",
+                p.bytes_per_sec
+            );
+            let actual = total as f64 / 200e6 - t;
+            let eta = p.eta_secs.unwrap();
+            assert!(
+                (eta - actual).abs() <= 0.1 * actual,
+                "at {t} s: {eta} s left, actually {actual} s"
+            );
+        }
     }
 
     // ---- whole runs against a mock app --------------------------------------
