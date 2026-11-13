@@ -1,6 +1,6 @@
 [package]
 name = "dino-copy-app"
-version = "0.3.0"
+version = "0.3.1"
 description = "Desktop app for dino-copy: mirror one disk onto another"
 license = "ISC"
 repository = "https://github.com/oberbichler/dino-copy"

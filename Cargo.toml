@@ -7,7 +7,7 @@ exclude = ["app"]
 
 [package]
 name = "dino-copy"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 # Kept under 80 characters and without a trailing full stop: dist copies this
 # verbatim into the Homebrew formula's `desc`, which `brew audit` checks.

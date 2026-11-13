@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1
+
+### DinoCopy
+
+- The progress bar, the time left and the speed stay steady while copying.
+  They are measured over the last 20 seconds; large files no longer throw
+  the estimate around, and the bar never moves back.
+- The disk chosen on one side is greyed out in the other side's list, so
+  that source and target cannot be the same disk.
+- Disks plugged in or ejected while the window is open show up right away.
+
+### Command line tool
+
+- No change.
+
 ## 0.3.0
 
 ### New: DinoCopy, the desktop app for macOS
