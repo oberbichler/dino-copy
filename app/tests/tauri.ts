@@ -21,7 +21,16 @@ declare global {
     __emit(event: string, payload: unknown): void;
     __resize(width: number, height: number): Promise<void>;
     __calls: { cmd: string; args: unknown }[];
+    /** The items of every menu the window created, newest last. */
+    __menus: MenuItem[][];
   }
+}
+
+export interface MenuItem {
+  text?: string;
+  enabled?: boolean;
+  checked?: boolean;
+  item?: unknown;
 }
 
 export const DISKS = [
@@ -41,6 +50,7 @@ function install(backend: Backend): void {
   let next = 1;
   window.__backend = backend;
   window.__calls = [];
+  window.__menus = [];
 
   /** Finds width and height in a serialized size, whatever its wrapping. */
   const size = (v: unknown): [number, number] | null => {
@@ -73,6 +83,11 @@ function install(backend: Backend): void {
         case "plugin:event|listen":
           (listeners[args.event as string] ??= []).push(args.handler as number);
           return args.handler;
+        case "plugin:menu|new": {
+          const options = args.options as { items?: MenuItem[] } | undefined;
+          if (options?.items) window.__menus.push(options.items);
+          return [next++, `menu-${next}`];
+        }
         case "plugin:window|set_size": {
           const s = size(args.value);
           if (s) await window.__resize(s[0], s[1]);

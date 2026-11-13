@@ -3,7 +3,8 @@
 //! The window is a thin layer over `dino-copy-core`; every rule about what is
 //! copied and what may be deleted lives there. This crate adds:
 //!
-//! - [`volumes`]: the drive list for the pickers;
+//! - [`volumes`]: the drive list for the pickers, and a `volumes://changed`
+//!   event when a disk is plugged in or ejected;
 //! - [`run`]: one mirror or scan at a time on a background thread, reporting
 //!   phases, progress, warnings and the result as events to the window.
 
@@ -11,7 +12,8 @@ mod run;
 mod volumes;
 
 use run::{Mode, RunState};
-use tauri::Manager;
+use std::time::Duration;
+use tauri::{Emitter, Manager};
 
 /// Volumes for the source/target pickers, read fresh on every call.
 #[tauri::command]
@@ -60,6 +62,12 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             app.manage(RunState::default());
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                volumes::watch("/Volumes".as_ref(), Duration::from_secs(1), || {
+                    let _ = handle.emit("volumes://changed", ());
+                })
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

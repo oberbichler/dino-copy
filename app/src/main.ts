@@ -184,8 +184,16 @@ async function openPicker(side: Side): Promise<void> {
   // Read fresh every time: a disk plugged in a moment ago must show up.
   const volumes = await invoke<Volume[]>("list_volumes");
   const current = state[side];
+  const otherSide: Side = side === "source" ? "target" : "source";
+  const other = state[otherSide];
   const items: MenuItems = [];
   for (const v of volumes) {
+    // The disk on the other side cannot be picked here as well: it says
+    // which side it is on instead.
+    if (other?.path === v.path) {
+      items.push({ text: `${v.name}  ·  ${t(otherSide)}`, enabled: false });
+      continue;
+    }
     const used = v.totalBytes - v.availableBytes;
     items.push({
       text: `${v.name}  ·  ${t("used", { used: fmt.bytes(used) })}`,
@@ -596,6 +604,8 @@ function wire(): void {
   void win.onFocusChanged(({ payload: focused }) => {
     if (focused) void refreshVolumes();
   });
+  // A disk was plugged in or ejected while the window is open.
+  void listen("volumes://changed", () => void refreshVolumes());
   $("done-ok").addEventListener("click", async () => {
     show("setup");
     await setWindow("small");
@@ -639,9 +649,9 @@ function wire(): void {
 }
 
 /**
- * Remembered disks: current free space, or "not connected". Runs at start
- * and whenever the window comes to the front (a disk may have been plugged
- * in or out meanwhile).
+ * Remembered disks: current free space, or "not connected". Runs at start,
+ * whenever the window comes to the front, and whenever a disk is plugged in
+ * or ejected.
  */
 async function refreshVolumes(): Promise<void> {
   if (state.running) return;

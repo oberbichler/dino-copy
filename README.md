@@ -185,7 +185,10 @@ keeps the Mac awake during a run and notifies when it is done.
 When something cannot be mirrored, the result says what happened and what to
 do, grouped by cause (the target is full, a file is too large for the target's
 format, no access, …); the full error lines are under **Details**. A
-remembered disk that is not connected says so.
+remembered disk that is not connected says so, and the window notices disks
+being plugged in or ejected while it is open. The disk chosen on one side is
+greyed out in the other side's list, so that source and target cannot be the
+same disk.
 
 The window follows the system language: English, German, French, Spanish,
 Italian, Dutch, Polish and Portuguese.

@@ -110,6 +110,52 @@ for (const lang of Object.keys(LANGUAGES) as Lang[]) {
       await tidy(page, "03-long-names");
     });
 
+    test("the other side's disk cannot be picked again", async ({ context }) => {
+      const page = await openWith(context);
+      const menu = async (side: "source" | "target") => {
+        const before = await page.evaluate(() => window.__menus.length);
+        await page.click(`#pick-${side}`);
+        await page.waitForFunction((n) => window.__menus.length > n, before);
+        return page.evaluate(() => window.__menus[window.__menus.length - 1]);
+      };
+
+      // Fotos-A is the source: in the target's menu it is shown, but not
+      // selectable, and says where it is.
+      const target = await menu("target");
+      const a = target.find((i) => i.text?.startsWith("Fotos-A"));
+      expect(a?.enabled).toBe(false);
+      expect(a?.text).toContain(text("source"));
+      const b = target.find((i) => i.text?.startsWith("Fotos-B"));
+      expect(b?.enabled).not.toBe(false);
+      expect(b?.checked).toBe(true);
+
+      const source = await menu("source");
+      expect(source.find((i) => i.text?.startsWith("Fotos-B"))?.enabled).toBe(false);
+      expect(source.find((i) => i.text?.startsWith("Fotos-B"))?.text).toContain(text("target"));
+      expect(source.find((i) => i.text?.startsWith("Fotos-A"))?.enabled).not.toBe(false);
+    });
+
+    test("a disk plugged in while the window is open is noticed", async ({ context }) => {
+      const page = await openWith(context, { volumes: [DISKS[0]], checkPair: { key: "targetMissing", path: "/Volumes/Fotos-B" } });
+      await expect(page.locator("#pick-target")).toHaveClass(/offline/);
+      await expect(page.locator("#start")).toBeDisabled();
+
+      await page.evaluate((disks) => {
+        window.__backend.volumes = disks;
+        window.__backend.checkPair = null;
+      }, DISKS);
+      await emit(page, "volumes://changed", null);
+      await expect(page.locator("#pick-target")).not.toHaveClass(/offline/);
+      await expect(page.locator("#start")).toBeEnabled();
+
+      // And ejected again.
+      await page.evaluate((disk) => {
+        window.__backend.volumes = [disk];
+      }, DISKS[0]);
+      await emit(page, "volumes://changed", null);
+      await expect(page.locator("#pick-target")).toHaveClass(/offline/);
+    });
+
     test("a pair that cannot be mirrored", async ({ context }) => {
       let page = await openWith(context, { checkPair: { key: "targetInsideSource" } });
       await expect(page.locator("#start")).toBeDisabled();

@@ -1,7 +1,9 @@
 //! The drive list: mounted volumes the user can pick as source or target.
 
 use serde::Serialize;
+use std::ffi::OsString;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -23,7 +25,10 @@ pub struct Volume {
 /// target must not be nested). Internal folders are picked via "Choose
 /// folder…" instead.
 pub fn list() -> Vec<Volume> {
-    let Ok(disks) = sysinfo::Disks::new_with_refreshed_list() else {
+    // Only the space: the I/O statistics of a full refresh are not needed and
+    // cost several times as much.
+    let refresh = sysinfo::DiskRefreshKind::nothing().with_storage();
+    let Ok(disks) = sysinfo::Disks::new_with_refreshed_list_specifics(refresh) else {
         return Vec::new();
     };
     let mut out: Vec<Volume> = disks
@@ -44,6 +49,31 @@ pub fn list() -> Vec<Volume> {
     out.sort_by_key(|v| v.name.to_lowercase());
     out.dedup_by(|a, b| a.path == b.path);
     out
+}
+
+/// Calls `on_change` whenever an entry appears in or disappears from `dir`
+/// (`/Volumes`: a disk was mounted or ejected), checking every `every`.
+/// Never returns.
+///
+/// Reading the directory touches none of the disks, so this costs next to
+/// nothing and never wakes a sleeping disk.
+pub fn watch(dir: &Path, every: Duration, on_change: impl Fn()) -> ! {
+    let names = || -> Vec<OsString> {
+        let mut names: Vec<OsString> = std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    let mut seen = names();
+    loop {
+        std::thread::sleep(every);
+        let now = names();
+        if now != seen {
+            seen = now;
+            on_change();
+        }
+    }
 }
 
 /// Volumes a user would mirror: directly under `/Volumes`, not the system's
@@ -68,6 +98,26 @@ mod tests {
         assert!(!is_user_volume(Path::new("/Volumes")));
         assert!(!is_user_volume(Path::new("/Volumes/A/nested")));
         assert!(!is_user_volume(Path::new("/Volumes/.timemachine")));
+    }
+
+    #[test]
+    fn plugging_in_and_ejecting_a_disk_is_noticed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = tmp.path().to_path_buf();
+        std::thread::spawn(move || {
+            watch(&dir, Duration::from_millis(20), || {
+                let _ = tx.send(());
+            })
+        });
+        let wait = || rx.recv_timeout(Duration::from_secs(2));
+
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rx.try_recv().is_err(), "no change, no notice");
+        std::fs::create_dir(tmp.path().join("Photos-A")).unwrap();
+        assert!(wait().is_ok(), "plugged in");
+        std::fs::remove_dir(tmp.path().join("Photos-A")).unwrap();
+        assert!(wait().is_ok(), "ejected");
     }
 
     #[test]
